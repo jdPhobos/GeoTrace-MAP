@@ -3,10 +3,6 @@
 Настольный инструмент визуализации сетевых маршрутов на карте мира с
 многоисточниковой геолокацией узлов.
 
-> Desktop traceroute visualizer with multi-source geolocation, an interactive
-> world map, continuous ping panels and self-learning node locations.
-> Russian / English UI.
-
 ## Возможности
 
 - **Трассировка** (`tracert`/`traceroute`) с парсингом прыжков, RTT (средний и
@@ -31,7 +27,7 @@
 
 ## Установка
 
-Требуется **Python 3.8+** (используется walrus-оператор `:=`).
+Требуется **Python 3.8+**
 
 ### Пакеты pip
 | Пакет | Установка | Зачем |
