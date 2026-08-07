@@ -2846,6 +2846,8 @@ class GeoTraceApp(tk.Tk):
         var fxCtx = fxCanvas.getContext('2d');
         var routePath = null, routeLen = 0, routePts = [], fxOffset = 0;
         var fxRunning = false, fxLast = 0;
+        var fxInteracting = false;
+        var fxInteractTimer = null;
         var FX_FPS = 25, FX_SPEED = 70;
 
         function sizeFx() {
@@ -2862,9 +2864,22 @@ class GeoTraceApp(tk.Tk):
         }
      var routePts = [];
      var routeStep = 6;
-     function findRoute() {
-         var lines = gd.querySelectorAll('.js-line');
-         routePath = lines[0] || lines[1] || null;
+function findRoute() {
+    var lines = Array.prototype.slice.call(gd.querySelectorAll('.js-line'));
+    routePath = null;
+
+    for (var i = lines.length - 1; i >= 0; i--) {
+        var stroke = (lines[i].getAttribute('stroke') || lines[i].style.stroke || '').toLowerCase();
+
+        if (stroke.indexOf('#d32f2f') !== -1 || stroke.indexOf('rgb(211') !== -1) {
+            routePath = lines[i];
+            break;
+        }
+    }
+
+    if (!routePath) {
+        routePath = lines[lines.length - 1] || null;
+    }
          routeLen = 0; routePts = [];
          if (!routePath) return;
          try { routeLen = routePath.getTotalLength(); } catch (e) { routeLen = 0; }
@@ -2885,10 +2900,15 @@ class GeoTraceApp(tk.Tk):
          return { x: routePts[i0] + (routePts[i1] - routePts[i0]) * t,
                   y: routePts[i0 + 1] + (routePts[i1 + 1] - routePts[i0 + 1]) * t };
      }
-     function fxTick(ts) {
-         if (!fxRunning) return;
-         requestAnimationFrame(fxTick);
-         if (ts - fxLast < 1000 / FX_FPS) return;
+function fxTick(ts) {
+    if (!fxRunning) return;
+    requestAnimationFrame(fxTick);
+
+    if (fxInteracting) {
+        if (fxCtx) fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+        return;
+    }
+    if (ts - fxLast < 1000 / FX_FPS) return;
          var dt = fxLast ? Math.min(0.1, (ts - fxLast) / 1000) : 0;
          fxLast = ts;
 fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
@@ -2931,12 +2951,52 @@ function fxStart() {
      	window.addEventListener('resize', relayoutFx);
      	gd.on('plotly_relayout', relayoutFx);
      // во время перетаскивания/зума Plotly переписывает путь — досэмплируем с троттлингом
-         var fxResampleQueued = false;
-     	gd.on('plotly_relayouting', function () {
-         if (fxResampleQueued) return;
-         fxResampleQueued = true;
-         setTimeout(function () { fxResampleQueued = false; findRoute(); }, 100);
-     });
+var fxResampleQueued = false;
+
+function fxInteractionStart() {
+    fxInteracting = true;
+
+    if (fxCtx) {
+        fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+    }
+
+    clearTimeout(fxInteractTimer);
+    fxInteractTimer = setTimeout(function () {
+        fxInteracting = false;
+        if (fxRunning) {
+            sizeFx();
+            findRoute();
+        }
+    }, 180);
+}
+
+gd.on('plotly_relayouting', function () {
+    fxInteractionStart();
+
+    if (fxResampleQueued) return;
+    fxResampleQueued = true;
+
+    setTimeout(function () {
+        fxResampleQueued = false;
+        findRoute();
+    }, 100);
+});
+
+gd.on('plotly_relayout', function () {
+    clearTimeout(fxInteractTimer);
+
+    fxInteractTimer = setTimeout(function () {
+        fxInteracting = false;
+        if (fxRunning) {
+            sizeFx();
+            findRoute();
+        }
+    }, 120);
+});
+
+gd.addEventListener('mousedown', fxInteractionStart);
+gd.addEventListener('wheel', fxInteractionStart, { passive: true });
+gd.addEventListener('touchstart', fxInteractionStart, { passive: true });
 
         function makeDraggable(el, handle) {
             handle.addEventListener('mousedown', function (e) {
