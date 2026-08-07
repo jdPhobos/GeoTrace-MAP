@@ -2911,8 +2911,10 @@ fxCtx.fill();
 fxCtx.lineWidth = 1;
 fxCtx.strokeStyle = '#ffffff';
 fxCtx.stroke();
+    }
 }
-        function fxStart() {
+
+function fxStart() {
             if (fxRunning || document.hidden) return;
             if (document.body.classList.contains('idle')) return;
             sizeFx(); findRoute();
