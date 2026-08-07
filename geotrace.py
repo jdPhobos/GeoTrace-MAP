@@ -3162,7 +3162,7 @@ fxCtx.stroke();
                     await new Promise(function (resolve, reject) { newScript.onload = resolve; newScript.onerror = reject; document.body.appendChild(newScript); });
                 }
                 var d = window.traceData;
-                if (!d) return;
+                if (!d || !d.markers) return;
                 if (lastRev !== null && d.map_rev !== lastRev) { window.location.reload(); return; }
                 lastRev = d.map_rev;
                 if (lastDataRev !== null && d.data_rev === lastDataRev) return;
@@ -3171,11 +3171,11 @@ fxCtx.stroke();
                 pollDelay = traceFinal ? 5000 : 1500;
                 applyTheme(d.theme || 'light');
                 var traces = [];
-                if (d.line_lon.length > 1) {
+                if (d.line_lon && d.line_lon.length > 1) {
                     traces.push({type: 'scattergeo', mode: 'lines', lon: d.line_lon, lat: d.line_lat, line: {width: 2, color: 'rgba(211,47,47,0.35)'}, hoverinfo: 'skip'});
                     traces.push({type: 'scattergeo', mode: 'lines', lon: d.line_lon, lat: d.line_lat, line: {width: 4, color: '#d32f2f'}, hoverinfo: 'skip'});
                 }
-                if (d.markers.length > 0) {
+                if (d.markers && d.markers.length > 0) {
                     traces.push({
                         type: 'scattergeo', mode: 'markers+text',
                         lon: d.markers.map(function(m){return m.lon;}),
@@ -3331,10 +3331,15 @@ fxCtx.stroke();
         js_file = CONFIG["data_js_file"]
         with open(js_file, "w", encoding="utf-8") as f:
             f.write(f"window.traceData = {json.dumps(payload, ensure_ascii=False)};")
+            f.flush()
+            os.fsync(f.fileno())
         if not self.map_opened:
             with open(CONFIG["map_file"], "w", encoding="utf-8") as f:
                 f.write(self._render_map_html(self.entry.get().strip()))
+                f.flush()
+                os.fsync(f.fileno())
             self.map_opened = True
+            time.sleep(0.3)
             if sys.platform == 'win32':
                 os.startfile(CONFIG["map_file"])
             else:
