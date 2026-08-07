@@ -240,6 +240,43 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
+# ---------------------------------------------------------------------------------------
+# Physical feasibility bounds, used by anycast/suspicious-hop detection and by the
+# geolocation-learning confidence math (GeoTraceApp._speed_bound / _min_rtt_for_distance).
+# Real fibre round-trip speed is ~100 km per ms of RTT, but real routes are appreciably
+# longer than the great-circle distance between two points (submarine cables hug
+# coastlines, terrestrial links follow rights-of-way, traffic backhauls through a distant
+# exchange, etc). A detour factor from the geolocation literature (see e.g. Gueye et al.,
+# "Constraint-Based Geolocation of Internet Hosts") is applied so a legitimately long,
+# winding route isn't treated as physically impossible just because it isn't a straight
+# line. GeoTraceApp._speed_bound() calibrates this further per-trace.
+# ---------------------------------------------------------------------------------------
+SPEED_KM_PER_MS = 100.0
+DETOUR_FACTOR = 1.4
+
+# Confidence weights for GeoTraceApp._eff()'s weighted-consensus city resolution — signals
+# that agree with each other on a location have their weights summed, so two independently
+# weaker signals that agree can outrank a single stronger one that disagrees with everything
+# else, instead of a strict first-match priority chain.
+SRC_WEIGHT = {
+    "ixp": 5.0,        # PeeringDB prefix match
+    "host": 4.0,       # PTR hostname city-code match
+    "learned": 3.2,    # locally-trained, multi-day-confirmed PTR match
+    "whois": 2.0,       # RIPEstat whois text city-code match
+    "near": 1.6,        # inherited from an adjacent hop with near-identical RTT
+    "geo_agree": 2.4,   # both independent GeoIP providers agree
+    "geo": 1.0,          # single GeoIP provider, no corroboration
+}
+
+# Router-hostname naming conventions typically place a location code directly next to an
+# interface/role identifier (digits, or a short keyword like core/edge/gw/...), e.g.
+# "ae1-0.FRA-tr1.example.net" or "xe-0-0-0.core2.LED.example.com". Preferring a code found
+# in that position over one found in an arbitrary label cuts down on coincidental matches of
+# ordinary words against short (often 3-letter) airport-style city codes.
+ROUTER_ROLE_WORDS = ("core", "edge", "gw", "rtr", "router", "ix", "peer", "px", "bb",
+                     "backbone", "transit", "agg")
+
+
 def ptr_city_code(ip: str) -> Optional[tuple]:
     try:
         host = socket.gethostbyaddr(ip)[0]
@@ -247,10 +284,25 @@ def ptr_city_code(ip: str) -> Optional[tuple]:
         return None
     if not host:
         return None
-    for tok in re.split(r'[^a-zA-Z]+', host):
-        tok = tok.lower().rstrip('0123456789')
+    labels = re.split(r'[.\-]', host)
+    hits = []
+    for i, raw in enumerate(labels):
+        tok = re.sub(r'[^a-zA-Z]', '', raw).lower()
         if len(tok) >= 3 and tok in CITY_DB:
+            neighbours = " ".join(labels[max(0, i - 1):i + 2]).lower()
+            has_digit = any(ch.isdigit() for ch in raw) or any(
+                any(ch.isdigit() for ch in labels[j]) for j in (i - 1, i + 1) if 0 <= j < len(labels))
+            has_role_word = any(w in neighbours for w in ROUTER_ROLE_WORDS)
+            hits.append((tok, has_digit or has_role_word))
+    if not hits:
+        return None
+    # prefer a hit sitting in a router-naming position; if nothing sits in that position,
+    # only accept a lone, unambiguous match rather than guessing between several
+    for tok, contextual in hits:
+        if contextual:
             return tok, host
+    if len(hits) == 1:
+        return hits[0][0], host
     return None
 
 
@@ -360,7 +412,7 @@ LANGS = {
         "learn_ev_bad": "⚠ задержка {} мс слишком мала для {} км до {} — вероятно, ошибка",
         "hist_empty": "история пуста",
         "about_title": "О программе",
-        "about_coding": "shitty vibe-coding with «Qwen3.8-Max»",
+        "about_coding": "shitty vibe-coding with \n«Qwen3.8-Max»\n «Claude»",
     },
     "en": {
         "title": "GeoTrace MAP", "addr": "Target address:",
@@ -415,7 +467,7 @@ LANGS = {
         "learn_ev_bad": "⚠ latency {} ms is too small for {} km to {} — likely wrong",
         "hist_empty": "history is empty",
         "about_title": "About",
-        "about_coding": "shitty vibe-coding with Qwen3.8-Max",
+        "about_coding": "shitty vibe-coding with \n«Qwen3.8-Max»\n «Claude»",
     },
 }
 
@@ -451,6 +503,8 @@ class GeoPoint:
     lon: float
     ms: Optional[float] = None
     ms_min: Optional[float] = None
+    ms_bound: bool = False   # True if the traceroute reading was an upper bound ("<1 ms"),
+                              # not a tight measurement — see rtt_pattern parsing below
     asn: str = ""
     org: str = ""
     src: str = "geo"
@@ -459,9 +513,12 @@ class GeoPoint:
     anycast: bool = False
     ixp: Optional[dict] = None
     role: str = ""
+    geo_agree: bool = False  # True if both independent GeoIP providers agreed
 
 
 class GeoLearner:
+    TRUST_THRESHOLD = 3.0  # accumulated confidence needed before a code is trusted
+
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
@@ -492,6 +549,13 @@ class GeoLearner:
                     continue
                 if last < (cut_t if st.get("trusted") else cut_c):
                     del codes[code]
+                    continue
+                # gently decay confidence on stale, not-yet-trusted candidates so an old,
+                # never-corroborated guess doesn't linger indefinitely just under the bar
+                if not st.get("trusted") and st.get("conf", 0.0) > 0:
+                    idle = (today - last).days
+                    if idle > 14:
+                        st["conf"] = round(st.get("conf", 0.0) * (0.9 ** (idle // 14)), 3)
             if not codes:
                 del self.data[ip]
         if len(self.data) > 2000:
@@ -524,18 +588,31 @@ class GeoLearner:
                         best = (code, k)
             return best[0] if best else None
 
-    def observe(self, ip, code, host):
+    def observe(self, ip, code, host, feasible=True, corroborated=False):
+        """Record a PTR-derived city-code observation for `ip`.
+
+        feasible: whether the RTT that produced this observation was physically consistent
+            with `code`'s location (see GeoTraceApp._learn_evidence / _min_rtt_for_distance).
+            Infeasible observations are discarded outright — they never accrue confidence,
+            so a coincidental hostname-token match with an impossible RTT can't get trusted
+            just by repeating a few times.
+        corroborated: whether an independent signal (GeoIP provider agreement) already
+            points at roughly the same place — corroborated observations count for more.
+        """
+        if not feasible:
+            return False
         today = datetime.date.today().isoformat()
         with self.lock:
             e = self.data.setdefault(ip, {"codes": {}})
-            st = e["codes"].setdefault(code, {"n": 0, "days": [], "last": today, "host": host})
+            st = e["codes"].setdefault(code, {"n": 0, "days": [], "last": today, "host": host, "conf": 0.0})
             st["n"] += 1
             st["last"] = today
             st["host"] = host
             if today not in st["days"]:
                 st["days"].append(today)
-            if not st.get("trusted") and st["n"] >= 2 and len(st["days"]) >= 2:
-                conflict = any(c != code and s.get("n", 0) >= 2 and len(s.get("days", [])) >= 2
+                st["conf"] = st.get("conf", 0.0) + (1.5 if corroborated else 1.0)
+            if not st.get("trusted") and st["conf"] >= self.TRUST_THRESHOLD and len(st["days"]) >= 2:
+                conflict = any(c != code and s.get("conf", 0.0) >= self.TRUST_THRESHOLD * 0.6
                                for c, s in e["codes"].items())
                 if not conflict:
                     st["trusted"] = True
@@ -546,12 +623,13 @@ class GeoLearner:
         today = datetime.date.today().isoformat()
         with self.lock:
             e = self.data.setdefault(ip, {"codes": {}})
-            st = e["codes"].setdefault(code, {"n": 0, "days": [], "last": today, "host": host})
+            st = e["codes"].setdefault(code, {"n": 0, "days": [], "last": today, "host": host, "conf": 0.0})
             st["n"] = max(st.get("n", 0), 1)
             st["last"] = today
             st["host"] = host
             if today not in st["days"]:
                 st["days"].append(today)
+            st["conf"] = max(st.get("conf", 0.0), self.TRUST_THRESHOLD)  # explicit human confirmation is authoritative
             st["trusted"] = True
             self.save()
 
@@ -727,15 +805,39 @@ ptr_cache = {}
 whois_cache = {}
 
 
+def _geo_dual(ip):
+    """Query both independent GeoIP providers (instead of treating the second as a mere
+    fallback) so agreement between them can be used as a confidence signal downstream — see
+    SRC_WEIGHT["geo_agree"] in GeoTraceApp._eff and GeoLearner's "corroborated" observations.
+    This costs one extra HTTP request per not-yet-cached hop versus the old fallback-only
+    behaviour; ip-api.com's free tier is rate-limited, so very large/rapid traces could hit
+    that limit slightly sooner than before."""
+    a = _geo_ipwhois(ip)
+    b = _geo_ipapi(ip)
+    primary = a or b
+    agree = False
+    if a and b:
+        if a["city"].strip().lower() == b["city"].strip().lower() and a["city"] not in ("", "Unknown"):
+            agree = True
+        else:
+            try:
+                agree = haversine(a["lat"], a["lon"], b["lat"], b["lon"]) < 50
+            except Exception:
+                agree = False
+    return primary, agree
+
+
 def get_ip_geo(ip):
-    data = geo_cache.get(ip)
-    if data is None:
-        data = _geo_ipwhois(ip) or _geo_ipapi(ip)
+    cached = geo_cache.get(ip)
+    if cached is None:
+        data, agree = _geo_dual(ip)
         if data is None:
             return None
-        geo_cache[ip] = data
-    return GeoPoint(hop=0, ip=ip, city=data["city"], country=data["country"],
-                    lat=data["lat"], lon=data["lon"], asn=data["asn"], org=data["org"])
+        cached = dict(data, agree=agree)
+        geo_cache[ip] = cached
+    return GeoPoint(hop=0, ip=ip, city=cached["city"], country=cached["country"],
+                    lat=cached["lat"], lon=cached["lon"], asn=cached["asn"], org=cached["org"],
+                    geo_agree=cached.get("agree", False))
 
 
 class PingManager:
@@ -967,7 +1069,7 @@ def trace_worker(target, callback, stop_event, app):
                 out["role"] = role
         return out
 
-    def submit_geo(ip, hop, ms, ms_min):
+    def submit_geo(ip, hop, ms, ms_min, ms_bound=False):
         try:
             fut = executor.submit(get_ip_geo, ip)
         except RuntimeError:
@@ -984,6 +1086,7 @@ def trace_worker(target, callback, stop_event, app):
                 g.hop = hop
                 g.ms = ms
                 g.ms_min = ms_min
+                g.ms_bound = ms_bound
                 g.anycast = is_anycast(g.asn, g.org)
                 submit_bgp(ip, g.asn)
                 callback("hop", g)
@@ -1073,12 +1176,15 @@ def trace_worker(target, callback, stop_event, app):
                 if not is_global:
                     continue
                 rtts = []
+                any_bound = False
                 for m in rtt_pattern.finditer(cleaned):
                     v = float(m.group(2).replace(",", "."))
-                    rtts.append(0.5 if m.group(1) else v)
+                    if m.group(1):
+                        any_bound = True  # "<Xms" — an upper bound, not a tight measurement
+                    rtts.append(v)
                 avg_ms = round(sum(rtts) / len(rtts), 1) if rtts else None
                 min_ms = round(min(rtts), 1) if rtts else None
-                submit_geo(ip, hop_index, avg_ms, min_ms)
+                submit_geo(ip, hop_index, avg_ms, min_ms, any_bound)
                 submit_ptr(ip)
                 hop_index += 1
     except Exception:
@@ -1192,22 +1298,89 @@ class GeoTraceApp(tk.Tk):
     def _rtt(self, h):
         return h.ms_min if h.ms_min is not None else h.ms
 
+    def _speed_bound(self):
+        """Km of great-circle distance considered feasible per ms of RTT, calibrated for
+        this trace. Starts from the fibre-speed default deflated by the assumed detour
+        factor (a real route is longer than a straight line), then loosens to whatever this
+        specific trace has already demonstrated between two confidently-located hops — so a
+        network that happens to run unusually direct routes doesn't get false "sus"/anycast
+        flags from an overly conservative global constant. Never exceeds the physical
+        ceiling (undeflated fibre speed)."""
+        best = SPEED_KM_PER_MS / DETOUR_FACTOR
+        confident_srcs = ("host", "learned", "ixp")
+        pts = []
+        for h in self._sorted_hops():
+            if h.ms_bound:
+                continue  # an upper-bound reading ("<1 ms") isn't tight enough to calibrate from
+            _, _, lat, lon, src = self._eff(h)
+            r = self._rtt(h)
+            if src in confident_srcs and r is not None:
+                pts.append((lat, lon, r))
+        for i in range(len(pts)):
+            for j in range(i + 1, len(pts)):
+                lat1, lon1, r1 = pts[i]
+                lat2, lon2, r2 = pts[j]
+                dr = abs(r1 - r2)
+                if dr > 1:
+                    dist = haversine(lat1, lon1, lat2, lon2)
+                    if dist > 200:
+                        best = max(best, dist / dr)
+        return min(best, SPEED_KM_PER_MS)
+
+    def _min_rtt_for_distance(self, dist_km, speed=None):
+        speed = speed or self._speed_bound()
+        return dist_km / speed if speed > 0 else float("inf")
+
+    def _learn_evidence(self, hop, code):
+        """Physical/GeoIP feasibility evidence for treating `code` as `hop`'s confirmed
+        city. Returns (feasible, corroborated, dist_km): feasible is False when the observed
+        RTT could not physically reach that far given the calibrated per-trace speed bound;
+        corroborated is True when GeoIP (dual-provider agreement, or the raw fallback city/
+        country) already points at roughly the same place."""
+        user = next((h for h in self.hops if h.hop == 0), None)
+        e = CITY_DB[code]
+        lat, lon = e[2], e[3]
+        dist = haversine(user.lat, user.lon, lat, lon) if user else None
+        r = self._rtt(hop)
+        feasible = True
+        if dist is not None and r is not None:
+            feasible = r >= self._min_rtt_for_distance(dist) * 0.5
+        geo_city_l = (hop.city or "").strip().lower()
+        corroborated = bool(hop.geo_agree) or geo_city_l in (e[0].lower(), e[1].lower())
+        return feasible, corroborated, (dist or 0.0)
+
     def _eff(self, h):
         ru = self.lang == "ru"
 
-        def city(code):
+        def city_of(code):
             e = CITY_DB[code]
-            return e[0] if ru else e[1], e[4] if ru else e[5], e[2], e[3]
+            return (e[0] if ru else e[1]), (e[4] if ru else e[5]), e[2], e[3]
+
+        # Weighted-consensus city resolution: gather every signal that has an opinion about
+        # this hop's location, weight each by how much that kind of signal is generally
+        # trusted (SRC_WEIGHT), then group signals that agree on (roughly) the same place
+        # and sum their weight. This lets two independently weaker signals that agree with
+        # each other occasionally outrank a single stronger signal that disagrees with
+        # everything else, instead of a strict first-match priority chain.
+        candidates = []  # (weight, group_key, city, country, lat, lon, src)
 
         if h.hcode and h.hcode in CITY_DB:
-            return *city(h.hcode), "host"
+            c, ct, la, lo = city_of(h.hcode)
+            candidates.append((SRC_WEIGHT["host"], ("code", h.hcode), c, ct, la, lo, "host"))
+
         code = self.learner.trusted_code(h.ip)
         if code and code in CITY_DB:
-            return *city(code), "learned"
+            c, ct, la, lo = city_of(code)
+            candidates.append((SRC_WEIGHT["learned"], ("code", code), c, ct, la, lo, "learned"))
+
         if h.ixp:
-            return h.ixp["city"], h.ixp["country"], h.ixp["lat"], h.ixp["lon"], "ixp"
+            candidates.append((SRC_WEIGHT["ixp"], ("ixp", h.ixp.get("name")),
+                                h.ixp["city"], h.ixp["country"], h.ixp["lat"], h.ixp["lon"], "ixp"))
+
         if h.wcode and h.wcode in CITY_DB:
-            return *city(h.wcode), "whois"
+            c, ct, la, lo = city_of(h.wcode)
+            candidates.append((SRC_WEIGHT["whois"], ("code", h.wcode), c, ct, la, lo, "whois"))
+
         hr = self._rtt(h)
         if hr is not None:
             prev = next((o for o in self.hops if o.hop == h.hop - 1), None)
@@ -1215,31 +1388,63 @@ class GeoTraceApp(tk.Tk):
             if prev is not None and pr is not None and abs(hr - pr) <= 2:
                 pc, pct, pla, plo, psrc = self._eff(prev)
                 if psrc in ("host", "learned", "whois", "near") or prev.hop == 0:
-                    return pc, pct, pla, plo, "near"
-        # fallback: GeoIP с переводом города/страны
+                    candidates.append((SRC_WEIGHT["near"], ("pt", round(pla, 2), round(plo, 2)),
+                                        pc, pct, pla, plo, "near"))
+
         c, ct = translate_city(h.city, h.country, self.lang)
-        return c, ct, h.lat, h.lon, h.src
+        geo_weight = SRC_WEIGHT["geo_agree"] if h.geo_agree else SRC_WEIGHT["geo"]
+        candidates.append((geo_weight, ("pt", round(h.lat, 2), round(h.lon, 2)), c, ct, h.lat, h.lon, h.src))
+
+        groups = {}
+        for w, key, cc, cct, cla, clo, csrc in candidates:
+            groups.setdefault(key, []).append((w, cc, cct, cla, clo, csrc))
+
+        best_key, best_total = None, -1.0
+        for key, members in groups.items():
+            total = sum(m[0] for m in members)
+            if total > best_total:
+                best_total, best_key = total, key
+        top = max(groups[best_key], key=lambda m: m[0])
+        return top[1], top[2], top[3], top[4], top[5]
 
     def _audit_sus(self):
+        """Cross-checks each non-anycast hop's claimed position against every previously
+        confirmed hop already walked in this trace (not just the immediately preceding one),
+        using a per-trace-calibrated, detour-adjusted speed-of-light bound (_speed_bound). A
+        hop that could not physically be as far away as GeoIP/PTR/whois claims, given how
+        little extra RTT it took to reach from multiple earlier reference points, either gets
+        folded into anycast detection (when its AS role looks like edge/CDN infrastructure)
+        or flagged suspicious otherwise (probably stale/wrong location data)."""
         sus = set()
-        prev = None
+        speed = self._speed_bound()
+        landmarks = []  # (rtt, lat, lon) of hops already trusted as position references
         for h in self._sorted_hops():
+            r = self._rtt(h)
             if h.anycast:
-                prev = None
                 continue
             _, _, lat, lon, src = self._eff(h)
-            r = self._rtt(h)
-            if h.role == "transit" or src == "ixp":
-                prev = (h.ip, r, lat, lon)
-                continue
-            if prev is not None and r is not None and prev[1] is not None:
-                d = haversine(prev[2], prev[3], lat, lon)
-                delta = max(0.0, r - prev[1])
-                if d > 400 and delta * 100 < d * 0.25:
-                    sus.add(h.ip)
-                    if src == "learned":
-                        self.learner.demote(h.ip)
-            prev = (h.ip, r, lat, lon)
+            if r is not None and landmarks:
+                checked = violations = 0
+                for p_r, p_lat, p_lon in landmarks:
+                    dist = haversine(p_lat, p_lon, lat, lon)
+                    if dist <= 400:
+                        continue
+                    checked += 1
+                    delta = max(0.0, r - p_r)
+                    if delta < self._min_rtt_for_distance(dist, speed) * 0.5:
+                        violations += 1
+                if checked and violations / checked >= 0.6:
+                    # too close (in time) to too many already-confirmed hops to really be
+                    # where GeoIP/PTR/whois claims — if this AS looks like edge/CDN
+                    # infrastructure treat it as anycast, otherwise flag it as suspect
+                    if h.role == "edge":
+                        h.anycast = True
+                    else:
+                        sus.add(h.ip)
+                        if src == "learned":
+                            self.learner.demote(h.ip)
+            if r is not None and not h.anycast and not h.ms_bound:
+                landmarks.append((r, lat, lon))
         return sus
 
     # ------------------------------------------------------------- UI
@@ -1558,7 +1763,7 @@ class GeoTraceApp(tk.Tk):
         user = next((h for h in self.hops if h.hop == 0), None)
         if user is not None and ev["ms"] is not None:
             dist = haversine(user.lat, user.lon, e[2], e[3])
-            if ev["ms"] >= dist / 100 * 0.75:
+            if ev["ms"] >= self._min_rtt_for_distance(dist) * 0.5:
                 lines.append(self.tr("learn_ev_ok", city, int(dist)))
             else:
                 lines.append(self.tr("learn_ev_bad", int(ev["ms"]), int(dist), city))
@@ -1789,7 +1994,8 @@ class GeoTraceApp(tk.Tk):
                     self._update_map(final=self.process is None)
                 if hop and code in CITY_DB and not hop.anycast:
                     if self.learn_mode == "auto":
-                        self.learner.observe(ip, code, host)
+                        feasible, corroborated, _dist = self._learn_evidence(hop, code)
+                        self.learner.observe(ip, code, host, feasible=feasible, corroborated=corroborated)
                     elif self.learn_mode == "semi":
                         if not self.learner.trusted_code(ip):
                             self._queue_suggestion({
@@ -1927,7 +2133,7 @@ class GeoTraceApp(tk.Tk):
         lines = [self.tr("report_title", self.entry.get().strip())]
         for h in self._sorted_hops():
             c, ct, _, _, src = self._eff(h)
-            ms = f" · {h.ms:.0f} {unit}" if h.ms is not None else ""
+            ms = f" · {'<' if h.ms_bound else ''}{h.ms:.0f} {unit}" if h.ms is not None else ""
             org = f" · {h.org}" if h.org else ""
             asn = f" ({h.asn})" if h.asn else ""
             src_sym = {"ixp": "⚡", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍"}.get(src, "🛰")
@@ -1955,12 +2161,12 @@ class GeoTraceApp(tk.Tk):
         sus = self._audit_sus()
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["hop", "ip", "city", "country", "lat", "lon", "avg_ms", "asn", "org",
+            w.writerow(["hop", "ip", "city", "country", "lat", "lon", "avg_ms", "ms_bound", "asn", "org",
                         "geo_src", "anycast", "suspect"])
             for h in self._sorted_hops():
                 c, ct, la, lo, src = self._eff(h)
                 w.writerow([h.hop, h.ip, c, ct, la, lo, h.ms if h.ms is not None else "",
-                            h.asn, h.org, src, 1 if h.anycast else 0, 1 if h.ip in sus else 0])
+                            1 if h.ms_bound else 0, h.asn, h.org, src, 1 if h.anycast else 0, 1 if h.ip in sus else 0])
 
     def _save_json(self):
         if not self.hops:
@@ -2151,7 +2357,7 @@ class GeoTraceApp(tk.Tk):
             return n + (n === 1 ? ' node' : ' nodes');
         }
         function latColor(ms) { if (ms == null) return '#0288d1'; if (ms < 50) return '#2e7d32'; if (ms < 150) return '#f57f17'; return '#c62828'; }
-        function fmtMs(ms) { return Math.round(ms) + ' ' + LSTR.ms; }
+        function fmtMs(ms, bound) { return (bound ? '<' : '') + Math.round(ms) + ' ' + LSTR.ms; }
         function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
         function srcLabel(it) {
             return it.src === 'host' ? LSTR.src_host :
@@ -2178,7 +2384,7 @@ class GeoTraceApp(tk.Tk):
                         '<div class="tt-line1">' +
                         '<span class="tt-hop" style="background:' + badge + '">' + it.hop + '</span>' +
                         '<span class="tt-ip">' + esc(it.ip) + '</span>' +
-                        (it.ms != null ? '<span class="tt-ms">' + fmtMs(it.ms) + '</span>' : '') +
+                        (it.ms != null ? '<span class="tt-ms">' + fmtMs(it.ms, it.ms_bound) + '</span>' : '') +
                         '</div>' +
                         '<div class="tt-org">' +
                         (multiCity ? esc(it.city) + ' · ' : '') +
@@ -2790,7 +2996,7 @@ gd.addEventListener('touchstart', fxInteractionStart, { passive: true });
                 c, ct, _, _, src = eff[h.ip]
                 line = f"{h.hop} · {c}, {ct} · {h.ip}"
                 if h.ms is not None:
-                    line += f" · {h.ms:.0f} {unit}"
+                    line += f" · {'<' if h.ms_bound else ''}{h.ms:.0f} {unit}"
                 if h.org:
                     line += f" · {h.org} ({h.asn})"
                 src_sym = {"ixp": "⚡", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍"}.get(src, "🛰")
@@ -2811,7 +3017,7 @@ gd.addEventListener('touchstart', fxInteractionStart, { passive: true });
                 "size": (14 if is_user else 12) + min(count - 1, 4) * 2,
                 "items": [
                     {"hop": h.hop, "ip": h.ip, "city": eff[h.ip][0], "country": eff[h.ip][1],
-                     "user": h.hop == 0, "ms": h.ms, "asn": h.asn, "org": h.org,
+                     "user": h.hop == 0, "ms": h.ms, "ms_bound": h.ms_bound, "asn": h.asn, "org": h.org,
                      "src": eff[h.ip][4], "role": h.role, "sus": h.ip in sus, "anycast": h.anycast}
                     for h in hops
                 ],
