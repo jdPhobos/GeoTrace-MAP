@@ -376,6 +376,8 @@ LANGS = {
         "report_title": "🌍 Маршрут до: {}", "report_ping": "📶 Пинг: {}",
         "report_copied": "Отчёт скопирован в буфер обмена",
         "html_saved": "Автономный HTML сохранён", "ms": "мс",
+        "m_pin": "Закрепить — тултип можно таскать за шапку",
+        "m_unpin": "Открепить и закрыть",
         "m_annot": "➜ направление движения: от вас к цели",
         "m_footer": "📡 клик по строке — непрерывный пинг",
         "m_seam": "⚡ стык сетей", "m_copied": "✔ Скопировано!",
@@ -432,6 +434,8 @@ LANGS = {
         "report_title": "🌍 Route to: {}", "report_ping": "📶 Ping: {}",
         "report_copied": "Report copied to clipboard",
         "html_saved": "Standalone HTML saved", "ms": "ms",
+        "m_pin": "Pin — tooltip becomes draggable by its header",
+        "m_unpin": "Unpin and close",
         "m_annot": "➜ direction of travel: from you to the target",
         "m_footer": "📡 click a row to run a continuous ping",
         "m_seam": "⚡ peering point", "m_copied": "✔ Copied!",
@@ -2227,6 +2231,7 @@ class GeoTraceApp(tk.Tk):
             "src_near": L["m_src_near"], "src_ixp": L["m_src_ixp"],
             "role_transit": L["m_role_transit"], "role_edge": L["m_role_edge"],
             "sus": L["m_sus"], "anycast": L["m_anycast"],
+            "pin": L["m_pin"], "unpin": L["m_unpin"],
         }
         html = """<!DOCTYPE html>
 <html lang="ru">
@@ -2244,8 +2249,13 @@ class GeoTraceApp(tk.Tk):
         #tooltip::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 4px; }
         #tooltip::-webkit-scrollbar-track { background: transparent; }
         .tt-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 4px 6px 8px 6px; border-bottom: 1px solid rgba(255,255,255,.08); margin-bottom: 6px; position: sticky; top: -8px; background: rgba(17, 24, 39, .97); margin-top: -8px; padding-top: 8px; border-radius: 12px 12px 0 0; z-index: 2; }
+        .pinned-tip { position: fixed; min-width: 250px; max-width: 340px; max-height: calc(100vh - 24px); overflow-y: auto; overflow-x: hidden; background: rgba(17, 24, 39, .96); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,.08); border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.4); padding: 8px; font-family: "Segoe UI", system-ui, Arial, sans-serif; color: #f9fafb; }
+        .pinned-tip .tt-header { cursor: move; user-select: none; }
         .tt-city { font-weight: 600; font-size: 13px; }
         .tt-count { font-size: 11px; color: #9ca3af; background: rgba(255,255,255,.08); padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
+        .tt-pin { margin-left: auto; background: rgba(255,255,255,.08); border: none; color: #e5e7eb; width: 24px; height: 24px; border-radius: 6px; cursor: pointer; font-size: 12px; line-height: 1; flex: 0 0 auto; filter: grayscale(70%); opacity: .75; }
+        .tt-pin:hover { background: rgba(79,195,247,.35); filter: none; opacity: 1; }
+        .tt-pin.on { background: rgba(79,195,247,.45); filter: none; opacity: 1; }
         .tt-row { padding: 5px 6px; border-radius: 7px; }
         .tt-row.tt-alt { background: rgba(255,255,255,.07); }
         .tt-row.tt-ping { cursor: pointer; }
@@ -2318,6 +2328,8 @@ class GeoTraceApp(tk.Tk):
         var labelColor = "#37474f";
         var mx = 0, my = 0;
         var tipVisible = false, tipHovered = false, follow = false;
+        var pinnedCards = {};        // key -> DOM-элемент закреплённой карточки
+        var currentTipMarker = null; // маркер, который сейчас показан в ховер-тултипе
         var hideTimer = null;
         var API_PORT = __API_PORT__;
         var API_TOKEN = __API_TOKEN__;
@@ -2379,6 +2391,7 @@ class GeoTraceApp(tk.Tk):
             var multiCity = m.items.some(function (x) { return x.city !== first.city; });
             var html = '<div class="tt-header"><span class="tt-city">' + head + '</span>';
             if (m.items.length > 1) html += '<span class="tt-count">' + pluralNodes(m.items.length) + '</span>';
+            html += '<button class="tt-pin" title="' + LSTR.pin + '">📌</button>';
             html += '</div>';
             m.items.forEach(function (it, i) {
                 var prev = i > 0 ? m.items[i - 1] : null;
@@ -2424,7 +2437,7 @@ gd.style.position = 'relative';
 gd.appendChild(fxCanvas);
 var fxCtx = fxCanvas.getContext('2d');
 
-var routePath = null, routeLen = 0, routePts = [], fxOffset = 0;
+var routePath = null, routeLen = 0, routePts = [], routeBreaks = [], fxOffset = 0;
 var fxRunning = false, fxLast = 0;
 var fxInteracting = false;
 var fxInteractTimer = null;
@@ -2469,6 +2482,7 @@ function findRoute() {
 
     routeLen = 0;
     routePts = [];
+    routeBreaks = [];
 
     if (!routePath) return;
 
@@ -2484,13 +2498,22 @@ function findRoute() {
         return;
     }
 
-    // 80 сэмплов обычно достаточно для пяти движущихся точек
     routeStep = Math.max(8, routeLen / 80);
     var n = Math.max(2, Math.floor(routeLen / routeStep));
 
+    var px = null, py = null;
+
     for (var j = 0; j <= n; j++) {
         var p = routePath.getPointAtLength(Math.min(routeLen, j * routeStep));
+        var k = routePts.length / 2;
+
+        if (px !== null && Math.hypot(p.x - px, p.y - py) > routeStep * 4) {
+            routeBreaks[k] = true;
+        }
+
         routePts.push(p.x, p.y);
+        px = p.x;
+        py = p.y;
     }
 }
 
@@ -2498,13 +2521,18 @@ function pointAt(d) {
     if (!routePts.length || !routeStep) return { x: 0, y: 0 };
 
     var idx = d / routeStep;
-    var i0 = Math.floor(idx) * 2;
-    var i1 = Math.min(routePts.length - 2, i0 + 2);
-    var t = idx - Math.floor(idx);
+    var i0 = Math.floor(idx);
+    var i1 = Math.min(routePts.length / 2 - 1, i0 + 1);
+
+    if (routeBreaks[i1]) {
+        return { x: routePts[i1 * 2], y: routePts[i1 * 2 + 1] };
+    }
+
+    var t = idx - i0;
 
     return {
-        x: routePts[i0] + (routePts[i1] - routePts[i0]) * t,
-        y: routePts[i0 + 1] + (routePts[i1 + 1] - routePts[i0 + 1]) * t
+        x: routePts[i0 * 2] + (routePts[i1 * 2] - routePts[i0 * 2]) * t,
+        y: routePts[i0 * 2 + 1] + (routePts[i1 * 2 + 1] - routePts[i0 * 2 + 1]) * t
     };
 }
 
@@ -2843,22 +2871,82 @@ gd.addEventListener('touchstart', fxInteractionStart, { passive: true });
         });
         tip.addEventListener('mouseenter', function () { tipHovered = true; clearTimeout(hideTimer); });
         tip.addEventListener('mouseleave', function () { tipHovered = false; scheduleHide(); });
-        tip.addEventListener('click', function (e) {
-            var row = e.target.closest('.tt-row');
-            if (!row) return;
-            var ip = row.getAttribute('data-ip');
-            if (ip) openPing(ip, row.getAttribute('data-city') || '');
-        });
+// ---------- множественные закрепляемые карточки узлов ----------
+        function tipKey(m) {
+    return m.items.map(function (it) { return it.ip; }).join(',');
+}
+
+        function spawnPinnedCard(m) {
+        var key = tipKey(m);
+                if (pinnedCards[key]) {                 // уже закреплён — просто на передний план
+        pinnedCards[key].style.zIndex = ++zTop;
+        return pinnedCards[key];
+    }
+        var r = tip.getBoundingClientRect();
+        var el = document.createElement('div');
+            el.className = 'pinned-tip';
+            el.setAttribute('data-key', key);
+            el.innerHTML = buildTooltip(m);
+        var pin = el.querySelector('.tt-pin');
+                if (pin) { pin.classList.add('on'); pin.title = LSTR.unpin; }
+            el.style.left = Math.max(4, Math.min(r.left, window.innerWidth - r.width - 4)) + 'px';
+            el.style.top = Math.max(4, Math.min(r.top, window.innerHeight - r.height - 4)) + 'px';
+            el.style.zIndex = ++zTop;
+    document.body.appendChild(el);
+    pinnedCards[key] = el;
+    makeTipDraggable(el);
+    return el;
+}
+
+        function makeTipDraggable(el) {
+    el.addEventListener('mousedown', function () { el.style.zIndex = ++zTop; });
+        var handle = el.querySelector('.tt-header');
+                if (!handle) return;
+    handle.addEventListener('mousedown', function (e) {
+                if (e.target.closest('.tt-pin')) return;
+        e.preventDefault();
+        var r = el.getBoundingClientRect();
+        var dx = e.clientX - r.left, dy = e.clientY - r.top;
+        function mv(ev) {
+            var x = Math.max(4, Math.min(ev.clientX - dx, window.innerWidth - 80));
+            var y = Math.max(4, Math.min(ev.clientY - dy, window.innerHeight - 40));
+            el.style.left = x + 'px'; el.style.top = y + 'px';
+        }
+        function up() { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); }
+        document.addEventListener('mousemove', mv);
+        document.addEventListener('mouseup', up);
+    });
+}
+
+// единый делегированный обработчик: 📌 и строки пинга во ВСЕХ карточках и в ховер-тултипе
+document.addEventListener('click', function (e) {
+        var pin = e.target.closest('.tt-pin');
+                if (pin) {
+        var card = pin.closest('.pinned-tip');
+                if (card) {                                   // 📌 на закреплённой карточке = закрыть её
+            delete pinnedCards[card.getAttribute('data-key')];
+            card.remove();
+        } else if (pin.closest('#tooltip') && currentTipMarker) {
+            spawnPinnedCard(currentTipMarker);        // закрепить текущий узел
+        }
+        return;
+    }
+        var row = e.target.closest('.tt-row');
+                if (!row) return;
+        var ip = row.getAttribute('data-ip');
+                if (ip) openPing(ip, row.getAttribute('data-city') || '');
+});
         gd.on('plotly_hover', function (data) {
-            var pt = data.points && data.points[0];
-            if (!pt || pt.pointNumber == null || !currentData) return;
-            var m = currentData.markers[pt.pointNumber];
-            if (!m) return;
-            clearTimeout(hideTimer);
-            tip.innerHTML = buildTooltip(m);
-            tip.classList.add('show'); tipVisible = true; follow = true;
-            positionTip();
-        });
+                var pt = data.points && data.points[0];
+    if (!pt || pt.pointNumber == null || !currentData) return;
+                var m = currentData.markers[pt.pointNumber];
+    if (!m) return;
+    currentTipMarker = m;   // запоминаем маркер — нужно кнопке 📌
+    clearTimeout(hideTimer);
+    tip.innerHTML = buildTooltip(m);
+    tip.classList.add('show'); tipVisible = true; follow = true;
+    positionTip();
+});
         gd.on('plotly_unhover', function () { follow = false; scheduleHide(); });
 
         async function update() {
