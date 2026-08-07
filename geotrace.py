@@ -9,22 +9,32 @@ import subprocess
 import threading
 import json
 import time
+import secrets
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional, Callable, List
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG = {
-    "map_file": os.path.join(os.path.expanduser("~"),"desktop_trace_map.html"),"data_js_file": os.path.join(os.path.expanduser("~"),"desktop_trace_data.js"),"settings_file": os.path.join(os.path.expanduser("~"),"geotrace_settings.json"),"learn_file": os.path.join(os.path.expanduser("~"),"geotrace_learned.json"),"peeringdb_file": os.path.join(os.path.expanduser("~"),"geotrace_peeringdb.json"),"timeout": 3,
+    "map_file": os.path.join(os.path.expanduser("~"), "desktop_trace_map.html"),
+    "data_js_file": os.path.join(os.path.expanduser("~"), "desktop_trace_data.js"),
+    "settings_file": os.path.join(os.path.expanduser("~"), "geotrace_settings.json"),
+    "learn_file": os.path.join(os.path.expanduser("~"), "geotrace_learned.json"),
+    "peeringdb_file": os.path.join(os.path.expanduser("~"), "geotrace_peeringdb.json"),
+    "timeout": 3,
 }
+
+# Global socket timeout so blocking calls with no explicit timeout (e.g. PTR lookups via
+# socket.gethostbyaddr in ptr_city_code) can't hang a worker thread indefinitely on a slow
+# or unresponsive DNS server. requests/session calls are unaffected — they always pass an
+# explicit timeout=. Set once at import time to avoid races from concurrent PTR workers
+# flipping this global back and forth.
+socket.setdefaulttimeout(CONFIG["timeout"])
 
 THEMES = {
     "light": {"bg": "#f2f4f8", "panel": "#e1e4ea", "fg": "#1f2937",
@@ -680,7 +690,7 @@ def get_public_ip() -> Optional[str]:
         ("https://ifconfig.me/ip", lambda r: r.text.strip())]
     for url, parser in services:
         try:
-            return parser(session.get(url, timeout=CONFIG["timeout"], verify=False))
+            return parser(session.get(url, timeout=CONFIG["timeout"]))
         except Exception:
             continue
     return None
@@ -688,7 +698,7 @@ def get_public_ip() -> Optional[str]:
 
 def _geo_ipwhois(ip):
     try:
-        resp = session.get(f"https://ipwho.is/{ip}", timeout=CONFIG["timeout"], verify=False).json()
+        resp = session.get(f"https://ipwho.is/{ip}", timeout=CONFIG["timeout"]).json()
     except Exception:
         return None
     if not (resp.get("success") and resp.get("latitude") is not None and resp.get("longitude") is not None):
@@ -824,12 +834,28 @@ class PingManager:
         return out
 
 
-def _start_api_server(manager):
+def _start_api_server(manager, token):
+    # Local control API for the map page (start/stop live pings). Two layers of defense
+    # against other software/webpages on the same machine driving it without the user's
+    # map page being involved:
+    #   1. CORS is scoped to the "null" origin that browsers send for file:// pages (the
+    #      map is opened as a local .html file) instead of "*". A page loaded from an
+    #      http(s) origin gets no Access-Control-Allow-Origin match, so its preflight for
+    #      state-changing POSTs fails and the browser blocks the request from being sent,
+    #      and any GET response it did receive can't be read cross-origin either.
+    #   2. State-changing POST actions (start/stop) must include the per-run secret token
+    #      that's embedded only in the rendered map HTML, so even a same-origin-looking
+    #      blind request can't drive the API without having read that file.
+    def _allowed_origin(origin):
+        # file:// pages send Origin: null; some browsers omit Origin for local files.
+        return origin is None or origin == "null"
+
     class Handler(BaseHTTPRequestHandler):
         def _cors(self, code=200):
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            if _allowed_origin(self.headers.get("Origin")):
+                self.send_header("Access-Control-Allow-Origin", "null")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
@@ -841,24 +867,26 @@ def _start_api_server(manager):
                 self.wfile.write(b'{"ok":true}')
 
         def do_POST(self):
-            if self.path.startswith("/api"):
+            if self.path.startswith("/api") and _allowed_origin(self.headers.get("Origin")):
                 length = int(self.headers.get("Content-Length") or 0)
                 try:
                     req = json.loads(self.rfile.read(length) or b"{}")
                 except Exception:
                     req = {}
-                action = req.get("action")
-                ip = str(req.get("ip", ""))
-                if action == "start" and re.fullmatch(r"[\w.\-:]+", ip):
-                    manager.start(ip)
-                elif action == "stop":
-                    manager.stop(ip)
+                if req.get("token") == token:
+                    action = req.get("action")
+                    ip = str(req.get("ip", ""))
+                    if action == "start" and re.fullmatch(r"[\w.\-:]+", ip):
+                        manager.start(ip)
+                    elif action == "stop":
+                        manager.stop(ip)
             self._cors()
             self.wfile.write(b'{"ok":true}')
 
         def do_OPTIONS(self):
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            if _allowed_origin(self.headers.get("Origin")):
+                self.send_header("Access-Control-Allow-Origin", "null")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "*")
             self.end_headers()
@@ -1112,8 +1140,9 @@ class GeoTraceApp(tk.Tk):
 
         self.ping_manager = PingManager(lang=self.lang)
         self.api_port = 0
+        self.api_token = secrets.token_urlsafe(24)
         try:
-            self.api_port, _ = _start_api_server(self.ping_manager)
+            self.api_port, _ = _start_api_server(self.ping_manager, self.api_token)
         except Exception:
             pass
 
@@ -1719,6 +1748,8 @@ class GeoTraceApp(tk.Tk):
         if self.process:
             try:
                 self.process.terminate()
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
                 self.process.kill()
             except Exception:
                 pass
@@ -1941,7 +1972,7 @@ class GeoTraceApp(tk.Tk):
         sus = self._audit_sus()
         hops = []
         for h in self._sorted_hops():
-            d = vars(h)
+            d = asdict(h)  # copy, not a reference to h.__dict__ — must not mutate the live hop
             c, ct, la, lo, src = self._eff(h)
             d.update({"eff_city": c, "eff_country": ct, "eff_lat": la, "eff_lon": lo,
                       "geo_src": src, "suspect": h.ip in sus})
@@ -1967,6 +1998,7 @@ class GeoTraceApp(tk.Tk):
     # ------------------------------------------------------------- map
     def _render_map_html(self, title, inline_payload=None, api_port=None):
         port = self.api_port if api_port is None else api_port
+        token = self.api_token if port else ""
         L = LANGS[self.lang]
         lstr = {
             "lang": self.lang,
@@ -2076,6 +2108,7 @@ class GeoTraceApp(tk.Tk):
         var tipVisible = false, tipHovered = false, follow = false;
         var hideTimer = null;
         var API_PORT = __API_PORT__;
+        var API_TOKEN = __API_TOKEN__;
         var panels = {};
         var panelSeq = 0;
         var zTop = 10001;
@@ -2097,7 +2130,7 @@ class GeoTraceApp(tk.Tk):
 
         function showToast(msg) { tst.textContent = msg; tst.style.display = 'block'; setTimeout(function () { tst.style.display = 'none'; }, 1500); }
         function apiGet() { return fetch('http://127.0.0.1:' + API_PORT + '/api').then(function (r) { return r.json(); }); }
-        function apiPost(obj) { return fetch('http://127.0.0.1:' + API_PORT + '/api', { method: 'POST', body: JSON.stringify(obj) }).catch(function () {}); }
+        function apiPost(obj) { obj.token = API_TOKEN; return fetch('http://127.0.0.1:' + API_PORT + '/api', { method: 'POST', body: JSON.stringify(obj) }).catch(function () {}); }
         function applyTheme(name) {
             var th = mapThemes[name] || mapThemes.light;
             document.body.style.background = th.body;
@@ -2702,6 +2735,7 @@ gd.addEventListener('touchstart', fxInteractionStart, { passive: true });
         html = html.replace("__DATA_SOURCE__", data_source)
         html = html.replace("__AUTOPOLL__", autopoll)
         html = html.replace("__API_PORT__", str(port))
+        html = html.replace("__API_TOKEN__", json.dumps(token))
         html = html.replace("__LSTR__", json.dumps(lstr, ensure_ascii=False))
         html = html.replace("__TITLE__", json.dumps(L["m_title"].format(title), ensure_ascii=False))
         html = html.replace("__MAP_THEMES__", json.dumps(MAP_THEMES, ensure_ascii=False))
