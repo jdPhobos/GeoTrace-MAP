@@ -1668,6 +1668,10 @@ class GeoTraceApp(tk.Tk):
         s.configure("TButton", background=t["panel"], foreground=t["fg"])
         s.map("TButton", background=[("active", t["accent"])],
               foreground=[("active", "#ffffff")])
+        s.configure("TRadiobutton", background=t["bg"], foreground=t["fg"])
+        s.map("TRadiobutton",
+              background=[("active", t["hover"])],
+              foreground=[("active", t["fg"])])
 
         self.configure(bg=t["bg"])
         self.log.config(bg=t["log_bg"], fg=t["log_fg"],
@@ -1705,10 +1709,12 @@ class GeoTraceApp(tk.Tk):
 
     # ------------------------------------------------------------- learning
     def _show_learn_dialog(self):
+        t = THEMES[self.theme]
         win = tk.Toplevel(self)
         win.title(self.tr("learn_title"))
         win.geometry("470x340")
         win.attributes("-topmost", True)
+        win.config(bg=t["bg"])
         ttk.Label(win, text=self.tr("learn_desc"), wraplength=440,
                   justify="left").pack(padx=12, pady=(12, 6))
         var = tk.StringVar(value=self.learn_mode)
