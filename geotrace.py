@@ -3322,31 +3322,71 @@ fxCtx.stroke();
         return {"line_lon": line_lon, "line_lat": line_lat, "markers": markers,
                 "final": final, "theme": self.theme, "map_rev": self.map_rev}
 
+    def _log_debug(self, msg: str) -> None:
+        """Логирование отладочных сообщений."""
+        log_file = os.path.join(os.path.expanduser("~"), "geotrace_debug.log")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] {msg}\n")
+                f.flush()
+        except Exception:
+            pass
+
     def _update_map(self, final: bool = False) -> None:
         if not self.hops:
+            self._log_debug("SKIP: нет hops для отображения")
             return
+        
+        self._log_debug(f"UPDATE_MAP: hops={len(self.hops)}, final={final}, map_opened={self.map_opened}")
+        
         payload = self._build_payload(final)
         self.data_rev += 1
         payload["data_rev"] = self.data_rev
         js_file = CONFIG["data_js_file"]
-        with open(js_file, "w", encoding="utf-8") as f:
-            f.write(f"window.traceData = {json.dumps(payload, ensure_ascii=False)};")
-            f.flush()
-            os.fsync(f.fileno())
-        if not self.map_opened:
-            with open(CONFIG["map_file"], "w", encoding="utf-8") as f:
-                f.write(self._render_map_html(self.entry.get().strip()))
+        
+        # Запись JS файла с данными
+        try:
+            with open(js_file, "w", encoding="utf-8") as f:
+                json_str = f"window.traceData = {json.dumps(payload, ensure_ascii=False)};"
+                f.write(json_str)
                 f.flush()
                 os.fsync(f.fileno())
+            self._log_debug(f"JS_FILE записан: {js_file}, размер={len(json_str)} байт")
+        except Exception as e:
+            self._log_debug(f"ERROR записи JS файла: {e}")
+        
+        if not self.map_opened:
+            # Генерация HTML
+            html_content = self._render_map_html(self.entry.get().strip())
+            map_file = CONFIG["map_file"]
+            try:
+                with open(map_file, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                self._log_debug(f"HTML_FILE записан: {map_file}, размер={len(html_content)} байт")
+            except Exception as e:
+                self._log_debug(f"ERROR записи HTML файла: {e}")
+            
             self.map_opened = True
-            time.sleep(0.3)
+            time.sleep(0.5)  # Увеличенная задержка для гарантии записи
+            
+            # Открытие браузера
             if sys.platform == 'win32':
-                os.startfile(CONFIG["map_file"])
+                try:
+                    os.startfile(map_file)
+                    self._log_debug(f"OPENED (win32): {map_file}")
+                except Exception as e:
+                    self._log_debug(f"ERROR открытия (win32): {e}")
             else:
                 try:
-                    subprocess.Popen(["xdg-open", CONFIG["map_file"]])
-                except Exception:
-                    pass
+                    proc = subprocess.Popen(["xdg-open", map_file])
+                    self._log_debug(f"OPENED (xdg-open): {map_file}, pid={proc.pid}")
+                except Exception as e:
+                    self._log_debug(f"ERROR открытия (xdg-open): {e}")
+        else:
+            self._log_debug(f"MAP уже открыт, обновляем данные (rev={self.data_rev})")
 
     # ------------------------------------------------------------- misc
     def _copy_log(self) -> None:
