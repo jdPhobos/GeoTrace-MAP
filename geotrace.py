@@ -23,12 +23,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CONFIG = {
-    "map_file": os.path.join(os.path.expanduser("~"), "desktop_trace_map.html"),
-    "data_js_file": os.path.join(os.path.expanduser("~"), "desktop_trace_data.js"),
-    "settings_file": os.path.join(os.path.expanduser("~"), "geotrace_settings.json"),
-    "learn_file": os.path.join(os.path.expanduser("~"), "geotrace_learned.json"),
-    "peeringdb_file": os.path.join(os.path.expanduser("~"), "geotrace_peeringdb.json"),
-    "timeout": 3,
+    "map_file": os.path.join(os.path.expanduser("~"),"desktop_trace_map.html"),"data_js_file": os.path.join(os.path.expanduser("~"),"desktop_trace_data.js"),"settings_file": os.path.join(os.path.expanduser("~"),"geotrace_settings.json"),"learn_file": os.path.join(os.path.expanduser("~"),"geotrace_learned.json"),"peeringdb_file": os.path.join(os.path.expanduser("~"),"geotrace_peeringdb.json"),"timeout": 3,
 }
 
 THEMES = {
@@ -2177,38 +2172,46 @@ class GeoTraceApp(tk.Tk):
         }
         function scheduleHide() { clearTimeout(hideTimer); hideTimer = setTimeout(function () { if (!tipHovered) { tip.classList.remove('show'); tipVisible = false; } }, 200); }
 
-        // пакеты на отдельном canvas: не инвалидирует SVG карты
-        var fxCanvas = document.createElement('canvas');
-        fxCanvas.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;z-index:5;will-change:transform;';
-        gd.style.position = 'relative';
-        gd.appendChild(fxCanvas);
-        var fxCtx = fxCanvas.getContext('2d');
-        var routePath = null, routeLen = 0, routePts = [], fxOffset = 0;
-        var fxRunning = false, fxLast = 0;
-        var fxInteracting = false;
-        var fxInteractTimer = null;
-        var FX_FPS = 25, FX_SPEED = 70;
+        // пакеты на отдельном canvas: оптимизированный режим (routeDirty + пауза при pan/zoom)
+var fxCanvas = document.createElement('canvas');
+fxCanvas.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;z-index:5;will-change:transform;';
+gd.style.position = 'relative';
+gd.appendChild(fxCanvas);
+var fxCtx = fxCanvas.getContext('2d');
 
-        function sizeFx() {
-            var dpr = Math.min(1.25, window.devicePixelRatio || 1);
-            var r = gd.getBoundingClientRect();
-            var w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
-            // перевыделяем буфер только если размер реально изменился
-            if (fxCanvas.width !== w || fxCanvas.height !== h) {
-                fxCanvas.width = w; fxCanvas.height = h;
-                fxCanvas.style.width = r.width + 'px';
-                fxCanvas.style.height = r.height + 'px';
-            }
-            fxCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        }
-     var routeStep = 6;
+var routePath = null, routeLen = 0, routePts = [], fxOffset = 0;
+var fxRunning = false, fxLast = 0;
+var fxInteracting = false;
+var fxInteractTimer = null;
+var routeDirty = true;
+var FX_FPS = 20, FX_SPEED = 70;
+var routeStep = 6;
+
+function sizeFx() {
+    var dpr = Math.min(1.25, window.devicePixelRatio || 1);
+    var r = gd.getBoundingClientRect();
+    var w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+
+    if (fxCanvas.width !== w || fxCanvas.height !== h) {
+        fxCanvas.width = w;
+        fxCanvas.height = h;
+        fxCanvas.style.width = r.width + 'px';
+        fxCanvas.style.height = r.height + 'px';
+    }
+
+    fxCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function markRouteDirty() {
+    routeDirty = true;
+}
+
 function findRoute() {
     var lines = Array.prototype.slice.call(gd.querySelectorAll('.js-line'));
     routePath = null;
 
     for (var i = lines.length - 1; i >= 0; i--) {
         var stroke = (lines[i].getAttribute('stroke') || lines[i].style.stroke || '').toLowerCase();
-
         if (stroke.indexOf('#d32f2f') !== -1 || stroke.indexOf('rgb(211') !== -1) {
             routePath = lines[i];
             break;
@@ -2218,78 +2221,47 @@ function findRoute() {
     if (!routePath) {
         routePath = lines[lines.length - 1] || null;
     }
-         routeLen = 0; routePts = [];
-         if (!routePath) return;
-         try { routeLen = routePath.getTotalLength(); } catch (e) { routeLen = 0; }
-         if (!routeLen || routeLen < 40) { routePath = null; routeLen = 0; return; }
-         // не больше ~110 сэмплов: точность достаточная, цена предсказуемая
-         routeStep = Math.max(6, routeLen / 110);
-         var n = Math.max(2, Math.floor(routeLen / routeStep));
-         for (var i = 0; i <= n; i++) {
-             var p = routePath.getPointAtLength(Math.min(routeLen, i * routeStep));
-             routePts.push(p.x, p.y);
-         }
-     }
-     function pointAt(d) {
-         var idx = d / routeStep;
-         var i0 = Math.floor(idx) * 2;
-         var i1 = Math.min(routePts.length - 2, i0 + 2);
-         var t = idx - Math.floor(idx);
-         return { x: routePts[i0] + (routePts[i1] - routePts[i0]) * t,
-                  y: routePts[i0 + 1] + (routePts[i1 + 1] - routePts[i0 + 1]) * t };
-     }
-function fxTick(ts) {
-    if (!fxRunning) return;
-    requestAnimationFrame(fxTick);
 
-    if (fxInteracting) {
-        if (fxCtx) fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+    routeLen = 0;
+    routePts = [];
+
+    if (!routePath) return;
+
+    try {
+        routeLen = routePath.getTotalLength();
+    } catch (e) {
+        routeLen = 0;
+    }
+
+    if (!routeLen || routeLen < 40) {
+        routePath = null;
+        routeLen = 0;
         return;
     }
-    if (ts - fxLast < 1000 / FX_FPS) return;
-         var dt = fxLast ? Math.min(0.1, (ts - fxLast) / 1000) : 0;
-         fxLast = ts;
-fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
-// путь перерисовывается при pan/zoom — перечитываем его КАЖДЫЙ кадр
-findRoute();
-if (!routePath || !routeLen) return;
-// живая матрица пути учитывает сдвиг/зум слоя даже до переписывания d
-var m = routePath.getScreenCTM();
-if (!m) return;
-var rect = gd.getBoundingClientRect();
-fxOffset = (fxOffset + dt * FX_SPEED) % routeLen;
-for (var i = 0; i < 5; i++) {
-var p = pointAt((fxOffset + routeLen / 5 * i) % routeLen);
-var sx = m.a * p.x + m.c * p.y + m.e - rect.left;
-var sy = m.b * p.x + m.d * p.y + m.f - rect.top;
-fxCtx.beginPath();
-fxCtx.arc(sx, sy, 4.5, 0, 6.2832);
-fxCtx.fillStyle = '#d32f2f';
-fxCtx.fill();
-fxCtx.lineWidth = 1;
-fxCtx.strokeStyle = '#ffffff';
-fxCtx.stroke();
+
+    // 80 сэмплов обычно достаточно для пяти движущихся точек
+    routeStep = Math.max(8, routeLen / 80);
+    var n = Math.max(2, Math.floor(routeLen / routeStep));
+
+    for (var j = 0; j <= n; j++) {
+        var p = routePath.getPointAtLength(Math.min(routeLen, j * routeStep));
+        routePts.push(p.x, p.y);
     }
 }
 
-function fxStart() {
-            if (fxRunning || document.hidden) return;
-            if (document.body.classList.contains('idle')) return;
-            sizeFx(); findRoute();
-            if (!routePath) return;
-            fxRunning = true; fxLast = 0;
-            requestAnimationFrame(fxTick);
-        }
-        function fxStop() {
-            fxRunning = false;
-            fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
-        }
-         var rsT = null;
-        function relayoutFx() { clearTimeout(rsT); rsT = setTimeout(function () { sizeFx(); findRoute(); }, 250); }
-     	window.addEventListener('resize', relayoutFx);
-     	gd.on('plotly_relayout', relayoutFx);
-     // во время перетаскивания/зума Plotly переписывает путь — досэмплируем с троттлингом
-var fxResampleQueued = false;
+function pointAt(d) {
+    if (!routePts.length || !routeStep) return { x: 0, y: 0 };
+
+    var idx = d / routeStep;
+    var i0 = Math.floor(idx) * 2;
+    var i1 = Math.min(routePts.length - 2, i0 + 2);
+    var t = idx - Math.floor(idx);
+
+    return {
+        x: routePts[i0] + (routePts[i1] - routePts[i0]) * t,
+        y: routePts[i0 + 1] + (routePts[i1 + 1] - routePts[i0 + 1]) * t
+    };
+}
 
 function fxInteractionStart() {
     fxInteracting = true;
@@ -2299,42 +2271,135 @@ function fxInteractionStart() {
     }
 
     clearTimeout(fxInteractTimer);
+
     fxInteractTimer = setTimeout(function () {
         fxInteracting = false;
-        if (fxRunning) {
-            sizeFx();
-            findRoute();
-        }
-    }, 180);
+        markRouteDirty();
+    }, 200);
 }
 
-gd.on('plotly_relayouting', function () {
-    fxInteractionStart();
-
-    if (fxResampleQueued) return;
-    fxResampleQueued = true;
-
-    setTimeout(function () {
-        fxResampleQueued = false;
-        findRoute();
-    }, 100);
-});
-
-gd.on('plotly_relayout', function () {
+function fxInteractionEnd() {
     clearTimeout(fxInteractTimer);
 
     fxInteractTimer = setTimeout(function () {
         fxInteracting = false;
-        if (fxRunning) {
-            sizeFx();
-            findRoute();
+        markRouteDirty();
+
+        if (!fxRunning && !document.hidden && !document.body.classList.contains('idle')) {
+            fxStart();
         }
     }, 120);
+}
+
+function fxStart() {
+    if (fxRunning || document.hidden || fxInteracting) return;
+    if (document.body.classList.contains('idle')) return;
+
+    sizeFx();
+
+    if (routeDirty || !routePath || !routePath.isConnected) {
+        findRoute();
+        routeDirty = false;
+    }
+
+    if (!routePath) return;
+
+    fxRunning = true;
+    fxLast = 0;
+    requestAnimationFrame(fxTick);
+}
+
+function fxStop() {
+    fxRunning = false;
+
+    if (fxCtx) {
+        fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+    }
+}
+
+function fxTick(ts) {
+    if (!fxRunning) return;
+    requestAnimationFrame(fxTick);
+
+    if (fxInteracting) return;
+
+    if (ts - fxLast < 1000 / FX_FPS) return;
+
+    var dt = fxLast ? Math.min(0.1, (ts - fxLast) / 1000) : 0;
+    fxLast = ts;
+
+    if (routePath && !routePath.isConnected) {
+        routeDirty = true;
+    }
+
+    if (routeDirty) {
+        findRoute();
+        routeDirty = false;
+
+        if (!routePath || !routeLen) {
+            if (fxCtx) fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+            return;
+        }
+    }
+
+    if (!routePath || !routeLen) {
+        if (fxCtx) fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+        return;
+    }
+
+    if (fxCtx) fxCtx.clearRect(0, 0, fxCanvas.width, fxCanvas.height);
+
+    var m = routePath.getScreenCTM();
+    if (!m) return;
+
+    var rect = gd.getBoundingClientRect();
+
+    fxOffset = (fxOffset + dt * FX_SPEED) % routeLen;
+
+    for (var i = 0; i < 5; i++) {
+        var p = pointAt((fxOffset + routeLen / 5 * i) % routeLen);
+
+        var sx = m.a * p.x + m.c * p.y + m.e - rect.left;
+        var sy = m.b * p.x + m.d * p.y + m.f - rect.top;
+
+        fxCtx.beginPath();
+        fxCtx.arc(sx, sy, 4.5, 0, 6.2832);
+        fxCtx.fillStyle = '#d32f2f';
+        fxCtx.fill();
+        fxCtx.lineWidth = 1;
+        fxCtx.strokeStyle = '#ffffff';
+        fxCtx.stroke();
+    }
+}
+
+var rsT = null;
+
+function relayoutFx() {
+    clearTimeout(rsT);
+
+    rsT = setTimeout(function () {
+        sizeFx();
+        markRouteDirty();
+    }, 250);
+}
+
+window.addEventListener('resize', relayoutFx);
+
+gd.on('plotly_relayout', function () {
+    relayoutFx();
+    fxInteractionEnd();
+});
+
+gd.on('plotly_relayouting', function () {
+    fxInteractionStart();
+    markRouteDirty();
 });
 
 gd.addEventListener('mousedown', fxInteractionStart);
 gd.addEventListener('wheel', fxInteractionStart, { passive: true });
 gd.addEventListener('touchstart', fxInteractionStart, { passive: true });
+
+
 
         function makeDraggable(el, handle) {
             handle.addEventListener('mousedown', function (e) {
@@ -2588,7 +2653,7 @@ gd.addEventListener('touchstart', fxInteractionStart, { passive: true });
                         customdata: d.markers.map(function(m){return m.copy;})
                     });
                 }
-                Plotly.react(gd, traces, layout).then(function () { findRoute(); fxStart(); });
+                Plotly.react(gd, traces, layout).then(function () { markRouteDirty(); fxStart(); });
             } catch (e) { console.error("Map update error:", e); }
         }
         gd.on('plotly_click', function (data) {
