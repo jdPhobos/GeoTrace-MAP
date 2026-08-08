@@ -74,4 +74,4 @@ GeoIP databases determine city by *registration* of the pool, not by physics, so
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](../LICENSE).
