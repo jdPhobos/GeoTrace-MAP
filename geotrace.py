@@ -119,8 +119,6 @@ CITY_DB = {
 
 # Переводы городов/стран для fallback (когда GeoIP вернул английское название)
 CITY_TRANSLATIONS = {
-    "Amursk": ("Амурск", "Россия"),
-    "Komsomolsk-on-Amur": ("Комсомольск-на-Амуре", "Россия"),
     "Moscow": ("Москва", "Россия"),
     "Saint Petersburg": ("Санкт-Петербург", "Россия"),
     "Yekaterinburg": ("Екатеринбург", "Россия"),
@@ -268,6 +266,15 @@ SRC_WEIGHT = {
     "geo": 1.0,          # single GeoIP provider, no corroboration
 }
 
+# Ceiling used to normalize _eff()'s confidence score — deliberately NOT "however much
+# weight happened to be present for this hop". Normalizing against only the present
+# candidates means a hop with a single weak, uncorroborated signal (e.g. raw GeoIP alone,
+# weight 1.0) trivially "wins" 100% of a 1.0-wide pool and displays as fully confident,
+# which is backwards: no competing evidence isn't the same as strong evidence. Normalizing
+# against a fixed ceiling — the weight of two strong independent signals agreeing — means a
+# lone weak signal correctly reads as low confidence instead.
+CONFIDENCE_CEILING = SRC_WEIGHT["ixp"] + SRC_WEIGHT["host"]
+
 # Router-hostname naming conventions typically place a location code directly next to an
 # interface/role identifier (digits, or a short keyword like core/edge/gw/...), e.g.
 # "ae1-0.FRA-tr1.example.net" or "xe-0-0-0.core2.LED.example.com". Preferring a code found
@@ -396,6 +403,13 @@ LANGS = {
         "m_src_ixp": "⚡ IXP", "m_role_transit": "🛣️ транзит", "m_role_edge": "🏠 край сети",
         "m_sus": "⚠ геолокация противоречит задержке",
         "m_anycast": "🌐 anycast CDN: вы на ближайшем edge-узле, GeoIP не отражает реальную точку",
+        "m_recovered": "🔧 узел восстановлен TCP-пробой (ICMP был заблокирован)",
+        "conf_intro": "Уверенность: сколько независимых источников подтверждают эту локацию.",
+        "conf_you": "Это ваш узел — локация известна, а не выведена.",
+        "conf_capped": "Снижено: задержка противоречит этой геолокации.",
+        "conf_boosted": "Только GeoIP, но задержка не противоречит соседним узлам.",
+        "conf_strong": "Подтверждено именем хоста или данными реестра, не только GeoIP.",
+        "conf_weak": "Только GeoIP, других подтверждений нет.",
         "learn_title": "🧠 Обучение геолокации",
         "learn_desc": "Программа запоминает города узлов, подтверждённые по hostname (PTR), и в дальнейшем использует их вместо GeoIP. База локальна; устаревшие и конфликтные записи отбрасываются; anycast не обучается.",
         "learn_off": "Выключено",
@@ -454,6 +468,13 @@ LANGS = {
         "m_src_ixp": "⚡ IXP", "m_role_transit": "🛣️ transit", "m_role_edge": "🏠 edge",
         "m_sus": "⚠ geolocation contradicts latency",
         "m_anycast": "🌐 anycast CDN: you're on the nearest edge node, GeoIP doesn't reflect the actual location",
+        "m_recovered": "🔧 hop recovered via TCP probe (ICMP was blocked)",
+        "conf_intro": "Confidence: how much independent evidence backs this location.",
+        "conf_you": "This is your own node — known, not inferred.",
+        "conf_capped": "Lowered: latency contradicts this geolocation.",
+        "conf_boosted": "GeoIP only, but latency doesn't contradict nearby hops.",
+        "conf_strong": "Confirmed by hostname or registry data, not just GeoIP.",
+        "conf_weak": "GeoIP only — nothing else confirms it.",
         "learn_title": "🧠 Geolocation learning",
         "learn_desc": "The app remembers node cities confirmed via hostname (PTR) and uses them instead of GeoIP. Local DB; stale/conflicting entries discarded; anycast never learned.",
         "learn_off": "Off", "learn_semi": "Semi-auto — ask before saving (recommended)",
@@ -518,6 +539,9 @@ class GeoPoint:
     ixp: Optional[dict] = None
     role: str = ""
     geo_agree: bool = False  # True if both independent GeoIP providers agreed
+    recovered: bool = False  # True if this hop timed out under the main trace and was
+                              # recovered by a supplementary TCP-SYN probe (see
+                              # trace_worker's post-trace fallback pass, POSIX only)
 
 
 class GeoLearner:
@@ -939,6 +963,30 @@ class PingManager:
             out[ip] = {"lines": lines, "running": e["running"], "stats": self._stats(e)}
         return out
 
+    def live_min_rtts(self):
+        """Minimum RTT (ms) observed so far for every IP with an active/recent continuous-
+        ping history. A running ping session accumulates dozens of samples and its min is a
+        much tighter, more reliable floor on true propagation delay than any single
+        traceroute probe — GeoTraceApp._rtt() folds this in wherever the user has actually
+        pinged a node, feeding real measured data back into the feasibility/audit math
+        instead of relying solely on the original trace's one-shot reading."""
+        out = {}
+        with self.lock:
+            items = list(self.pings.items())
+        for ip, e in items:
+            with e["lock"]:
+                lines = list(e["lines"])
+            best = None
+            for ln in lines:
+                m = re.search(r'(?:time|время)\s*[<=]\s*(\d+(?:[.,]\d+)?)', ln, re.I)
+                if m:
+                    v = float(m.group(1).replace(",", "."))
+                    if best is None or v < best:
+                        best = v
+            if best is not None:
+                out[ip] = best
+        return out
+
 
 def _start_api_server(manager, token):
     # Local control API for the map page (start/stop live pings). Two layers of defense
@@ -1011,21 +1059,58 @@ def trace_worker(target, callback, stop_event, app):
     callback("log", L["log_geo"])
 
     is_windows = sys.platform == 'win32'
-    cmd = (["tracert", "-d", "-h", "30", target] if is_windows
-           else ["traceroute", "-n", "-m", "30", target])
     startupinfo = None
     if is_windows:
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
+
+    def _spawn(cmd):
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding='cp866' if is_windows else 'utf-8',
+                                startupinfo=startupinfo, errors='ignore')
+
+    if is_windows:
+        cmd = ["tracert", "-d", "-h", "30", target]
+    else:
+        # -I (ICMP echo mode) keeps every probe's identifying header field constant across
+        # all TTLs, instead of the default UDP mode's destination port changing on every
+        # probe. Many routers hash ECMP/load-balanced next-hop selection on exactly that
+        # field, so the default mode can silently splice together hops from several
+        # different real paths into what looks like one continuous route. This isn't a
+        # full Paris-traceroute (which pins even more of the 5-tuple and explicitly
+        # verifies per-flow path consistency), but it's a meaningful improvement for zero
+        # extra dependencies, using the stock traceroute binary. -I needs the same
+        # raw-socket privilege the default mode already needs to *receive* ICMP replies, so
+        # this is low-risk — but if it's genuinely unavailable, we fall back below rather
+        # than leaving the user with a broken trace.
+        cmd = ["traceroute", "-n", "-m", "30", "-I", target]
     try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, encoding='cp866' if is_windows else 'utf-8',
-                                   startupinfo=startupinfo, errors='ignore')
+        process = _spawn(cmd)
         app.process = process
     except Exception as e:
         callback("error", L["util_fail"].format(e))
         return
+
+    if not is_windows and "-I" in cmd:
+        time.sleep(0.3)
+        if process.poll() is not None:
+            early = ""
+            try:
+                early = process.stdout.read(2000) or ""
+            except Exception:
+                pass
+            if not re.search(r'^\s*\d+\s', early, re.M):
+                # ICMP mode failed before producing a single real hop line (typically a
+                # permission error for raw ICMP sockets) — fall back to default UDP mode
+                # rather than leaving the user with nothing
+                cmd = ["traceroute", "-n", "-m", "30", target]
+                try:
+                    process = _spawn(cmd)
+                    app.process = process
+                except Exception as e:
+                    callback("error", L["util_fail"].format(e))
+                    return
 
     # собственный IP определяем, пока процесс уже «греется»
     if my_ip := get_public_ip():
@@ -1073,7 +1158,7 @@ def trace_worker(target, callback, stop_event, app):
                 out["role"] = role
         return out
 
-    def submit_geo(ip, hop, ms, ms_min, ms_bound=False):
+    def submit_geo(ip, hop, ms, ms_min, ms_bound=False, recovered=False):
         try:
             fut = executor.submit(get_ip_geo, ip)
         except RuntimeError:
@@ -1091,6 +1176,7 @@ def trace_worker(target, callback, stop_event, app):
                 g.ms = ms
                 g.ms_min = ms_min
                 g.ms_bound = ms_bound
+                g.recovered = recovered
                 g.anycast = is_anycast(g.asn, g.org)
                 submit_bgp(ip, g.asn)
                 callback("hop", g)
@@ -1150,6 +1236,10 @@ def trace_worker(target, callback, stop_event, app):
     hop_index = 1
     total_lines = 0       # всего строк с hop'ами (глобальные + приватные + таймауты)
     timeout_lines = 0     # сколько из них — таймауты
+    ttl_pattern = re.compile(r'^\s*(\d+)')
+    ttl_hop_map = {}   # raw TTL -> assigned hop_index, for resolved global hops only —
+                        # used below to place TCP-recovered hops at the right position
+    gap_ttls = []       # raw TTLs that came back as a pure timeout (no IP at all)
     try:
         for line in iter(process.stdout.readline, ""):
             if stop_event.is_set():
@@ -1171,11 +1261,15 @@ def trace_worker(target, callback, stop_event, app):
                     is_global = ipaddress.ip_address(ip).is_global
                 except ValueError:
                     pass
+            ttl_m = ttl_pattern.match(cleaned)
+            raw_ttl = int(ttl_m.group(1)) if ttl_m else None
             # hop-строка — если есть IP или таймаут
             if ips or has_timeout:
                 total_lines += 1
                 if has_timeout and not is_global:
                     timeout_lines += 1
+                    if not ips and raw_ttl is not None:
+                        gap_ttls.append(raw_ttl)
             if ips:
                 if not is_global:
                     continue
@@ -1190,6 +1284,8 @@ def trace_worker(target, callback, stop_event, app):
                 min_ms = round(min(rtts), 1) if rtts else None
                 submit_geo(ip, hop_index, avg_ms, min_ms, any_bound)
                 submit_ptr(ip)
+                if raw_ttl is not None:
+                    ttl_hop_map[raw_ttl] = hop_index
                 hop_index += 1
     except Exception:
         pass
@@ -1200,6 +1296,69 @@ def trace_worker(target, callback, stop_event, app):
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             process.kill()
+
+    # TCP-SYN fallback for hops that timed out under the main trace, POSIX only: some
+    # firewalls drop ICMP entirely at the edge while still forwarding TCP through — a
+    # router that never replies to an ICMP-based probe (echo or time-exceeded) often
+    # replies normally to a TCP-based one at the same TTL, since the time-exceeded reply
+    # a transit router generates is independent of the expiring packet's payload
+    # protocol. Only attempted for gaps strictly between two already-resolved hops
+    # (recovering past the destination, or before the first real hop, isn't meaningful),
+    # and gracefully recovers nothing if this traceroute build doesn't support -T (e.g.
+    # some BSD/macOS builds use different flags for TCP mode) or lacks the privilege to
+    # run it — never turns a working trace into a broken one.
+    if not is_windows and not stop_event.is_set() and gap_ttls:
+        real_ttls = sorted(ttl_hop_map)
+        recover_executor = ThreadPoolExecutor(max_workers=3)
+
+        def _tcp_probe_hop(ttl):
+            cmd = ["traceroute", "-n", "-T", "-p", "443", "-f", str(ttl), "-m", str(ttl), target]
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=6, errors="ignore")
+            except Exception:
+                return None
+            for ln in (out.stdout or "").splitlines():
+                found = ip_pattern.findall(ln)
+                if not found:
+                    continue
+                cand = found[-1].strip()
+                try:
+                    if not ipaddress.ip_address(cand).is_global:
+                        continue
+                except ValueError:
+                    continue
+                rtts = [float(m.group(2).replace(",", ".")) for m in rtt_pattern.finditer(ln)]
+                return (cand, round(sum(rtts) / len(rtts), 1) if rtts else None,
+                        round(min(rtts), 1) if rtts else None)
+            return None
+
+        for gap_ttl in gap_ttls:
+            lower = max((t for t in real_ttls if t < gap_ttl), default=None)
+            upper = min((t for t in real_ttls if t > gap_ttl), default=None)
+            if lower is None or upper is None:
+                continue
+            try:
+                fut = recover_executor.submit(_tcp_probe_hop, gap_ttl)
+            except RuntimeError:
+                continue
+
+            def on_recovered(f, ttl=gap_ttl, lower=lower, upper=upper):
+                if stop_event.is_set():
+                    return
+                try:
+                    res = f.result()
+                except Exception:
+                    res = None
+                if not res:
+                    return
+                ip, avg_ms, min_ms = res
+                frac_hop = (ttl_hop_map[lower] +
+                           (ttl_hop_map[upper] - ttl_hop_map[lower]) * (ttl - lower) / (upper - lower))
+                submit_geo(ip, frac_hop, avg_ms, min_ms, False, True)
+                submit_ptr(ip)
+            fut.add_done_callback(on_recovered)
+        recover_executor.shutdown(wait=True)
+
     executor.shutdown(wait=True)
     ptr_executor.shutdown(wait=False)
     whois_executor.shutdown(wait=False)
@@ -1215,6 +1374,10 @@ class GeoTraceApp(tk.Tk):
         self.geometry("560x646")
 
         self.hops: List[GeoPoint] = []
+        self._live_rtt = {}   # ip -> min RTT (ms) from an active continuous-ping session,
+                                # refreshed each _audit_sus() pass — see PingManager.live_min_rtts
+        self._eff_conf = {}   # ip -> consensus confidence (0-1) from the last _eff() call,
+                                # populated as a side effect so callers can display it
         self.map_opened = False
         self.process: Optional[subprocess.Popen] = None
         self.stop_event = threading.Event()
@@ -1300,7 +1463,11 @@ class GeoTraceApp(tk.Tk):
 
     # ------------------------------------------------------------- geo
     def _rtt(self, h):
-        return h.ms_min if h.ms_min is not None else h.ms
+        live = self._live_rtt.get(h.ip)
+        base = h.ms_min if h.ms_min is not None else h.ms
+        if live is None:
+            return base
+        return live if base is None else min(live, base)
 
     def _speed_bound(self):
         """Km of great-circle distance considered feasible per ms of RTT, calibrated for
@@ -1408,8 +1575,64 @@ class GeoTraceApp(tk.Tk):
             total = sum(m[0] for m in members)
             if total > best_total:
                 best_total, best_key = total, key
+        runner_up = max((sum(m[0] for m in mem) for key, mem in groups.items() if key != best_key),
+                        default=0.0)
+        # Confidence reflects the winning group's margin over its strongest competitor,
+        # normalized against a fixed ceiling (CONFIDENCE_CEILING) rather than against
+        # whatever weight happened to be present. Normalizing against only-what's-present
+        # would let a single weak, uncorroborated signal (e.g. raw GeoIP alone) trivially
+        # "win" 100% of its own tiny pool — no competing evidence isn't strong evidence.
+        margin = max(0.0, best_total - runner_up)
+        self._eff_conf[h.ip] = round(min(1.0, margin / CONFIDENCE_CEILING), 3)
         top = max(groups[best_key], key=lambda m: m[0])
         return top[1], top[2], top[3], top[4], top[5]
+
+    def _conf(self, h, sus, consistent=frozenset()):
+        """Display-ready consensus confidence for a hop: the raw weighted-consensus score
+        from _eff() (how much corroborating signal backs the winning location), adjusted by
+        what _audit_sus() independently found when cross-checking RTT physics — capped low
+        when it found the location physically inconsistent, nudged up when it found the
+        location consistent with every distant landmark checked (real, if modest,
+        corroboration for a hop whose location otherwise rests on GeoIP alone). Computed
+        here rather than mutated inside _audit_sus() itself, because _eff() is called again
+        by every caller after _audit_sus() runs and would silently recompute (and overwrite)
+        an adjusted value otherwise — a hop must never display as both "suspicious" and
+        "confident" at once.
+
+        Hop 0 ("you") is exempt: it's the trace's own anchor point, not an inference about a
+        downstream router, so it isn't subject to the same signal-corroboration uncertainty
+        as the rest of the route — showing an inference-confidence badge next to "you are
+        here" is confusing regardless of how the underlying signals happen to score."""
+        if h.hop == 0:
+            return 1.0
+        c = self._eff_conf.get(h.ip, 1.0)
+        if h.ip in sus:
+            return min(c, 0.3)
+        if h.ip in consistent:
+            return min(1.0, c + 0.15)
+        return c
+
+    def _conf_note(self, h, sus, consistent, src):
+        """Short, plain-language explanation for the confidence badge's hover tooltip.
+        Priority matters here: a strong signal (host/learned/whois/ixp) explains the score
+        even when the hop is also RTT-consistent, since _conf()'s "consistent" boost is a
+        flat +0.15 nudge that's really only the *story* when GeoIP was the only source to
+        begin with — checking `consistent` before `src` would (and did) mislabel a
+        hostname-confirmed hop as "GeoIP only". Two short lines (not one long one) so the
+        native tooltip wraps compactly instead of stretching to the screen edge."""
+        L = LANGS[self.lang]
+        intro = L["conf_intro"]
+        if h.hop == 0:
+            reason = L["conf_you"]
+        elif h.ip in sus:
+            reason = L["conf_capped"]
+        elif src in ("host", "learned", "whois", "ixp"):
+            reason = L["conf_strong"]
+        elif h.ip in consistent:
+            reason = L["conf_boosted"]
+        else:
+            reason = L["conf_weak"]
+        return f"{intro}\n{reason}"
 
     def _audit_sus(self):
         """Cross-checks each non-anycast hop's claimed position against every previously
@@ -1418,8 +1641,17 @@ class GeoTraceApp(tk.Tk):
         hop that could not physically be as far away as GeoIP/PTR/whois claims, given how
         little extra RTT it took to reach from multiple earlier reference points, either gets
         folded into anycast detection (when its AS role looks like edge/CDN infrastructure)
-        or flagged suspicious otherwise (probably stale/wrong location data)."""
+        or flagged suspicious otherwise (probably stale/wrong location data).
+
+        Also returns the complementary positive case: hops fully consistent with every
+        distant landmark checked so far. That's real, if modest, corroboration for a hop
+        whose location otherwise rests on GeoIP alone — see _conf(), which uses it to
+        separate "GeoIP said X and nothing contradicts it" from "GeoIP said X and we have
+        no way to check it", instead of both reading as the same flat, uninformative
+        number."""
+        self._live_rtt = self.ping_manager.live_min_rtts()
         sus = set()
+        consistent = set()
         speed = self._speed_bound()
         landmarks = []  # (rtt, lat, lon) of hops already trusted as position references
         for h in self._sorted_hops():
@@ -1437,19 +1669,23 @@ class GeoTraceApp(tk.Tk):
                     delta = max(0.0, r - p_r)
                     if delta < self._min_rtt_for_distance(dist, speed) * 0.5:
                         violations += 1
-                if checked and violations / checked >= 0.6:
-                    # too close (in time) to too many already-confirmed hops to really be
-                    # where GeoIP/PTR/whois claims — if this AS looks like edge/CDN
-                    # infrastructure treat it as anycast, otherwise flag it as suspect
-                    if h.role == "edge":
-                        h.anycast = True
-                    else:
-                        sus.add(h.ip)
-                        if src == "learned":
-                            self.learner.demote(h.ip)
+                if checked:
+                    ratio = violations / checked
+                    if ratio >= 0.6:
+                        # too close (in time) to too many already-confirmed hops to really
+                        # be where GeoIP/PTR/whois claims — if this AS looks like edge/CDN
+                        # infrastructure treat it as anycast, otherwise flag it as suspect
+                        if h.role == "edge":
+                            h.anycast = True
+                        else:
+                            sus.add(h.ip)
+                            if src == "learned":
+                                self.learner.demote(h.ip)
+                    elif ratio == 0:
+                        consistent.add(h.ip)
             if r is not None and not h.anycast and not h.ms_bound:
                 landmarks.append((r, lat, lon))
-        return sus
+        return sus, consistent
 
     # ------------------------------------------------------------- UI
     def _setup_ui(self):
@@ -1472,7 +1708,7 @@ class GeoTraceApp(tk.Tk):
 
         self.entry = ttk.Entry(entry_frame, font=("Arial", 10))
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.entry.insert(0, "example.com")
+        self.entry.insert(0, self.history[0] if self.history else "example.com")
 
         self.entry.bind("<FocusIn>", self._on_entry_focus)
         self.entry.bind("<Return>", lambda e: self._toggle_trace())
@@ -1858,7 +2094,7 @@ class GeoTraceApp(tk.Tk):
 
     def _entry_copy(self, event=None):
         try:
-            sel = self.entry.get(tk.SEL_FIRST, tk.SEL_LAST)
+            sel = self.entry.selection_get()
         except tk.TclError:
             sel = ""
         if sel:
@@ -2139,7 +2375,7 @@ class GeoTraceApp(tk.Tk):
         if not self.hops:
             return
         unit = self.tr("ms")
-        sus = self._audit_sus()
+        sus, consistent = self._audit_sus()
         lines = [self.tr("report_title", self.entry.get().strip())]
         for h in self._sorted_hops():
             c, ct, _, _, src = self._eff(h)
@@ -2148,9 +2384,12 @@ class GeoTraceApp(tk.Tk):
             asn = f" ({h.asn})" if h.asn else ""
             src_sym = {"ixp": "⚡", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍"}.get(src, "🛰")
             ac = " · 🌐" if h.anycast else ""
+            rec = " · 🔧" if h.recovered else ""
             warn = " · ⚠" if h.ip in sus else ""
             role = " · 🛣️" if h.role == "transit" else (" · 🏠" if h.role == "edge" else "")
-            lines.append(f"{h.hop} · {c}, {ct} · {h.ip}{ms}{org}{asn}{role} · {src_sym}{ac}{warn}")
+            conf = self._conf(h, sus, consistent)
+            low_conf = f" · {conf:.0%}" if conf < 0.6 else ""
+            lines.append(f"{h.hop} · {c}, {ct} · {h.ip}{ms}{org}{asn}{role} · {src_sym}{low_conf}{rec}{ac}{warn}")
         if self.trace_stats:
             skip = self.trace_stats["total"] - self.trace_stats["global"]
             if skip > 0:
@@ -2168,15 +2407,16 @@ class GeoTraceApp(tk.Tk):
                                             initialfile=f"trace_{clean_target(self.entry.get())}.csv")
         if not path:
             return
-        sus = self._audit_sus()
+        sus, consistent = self._audit_sus()
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f, delimiter=";")
             w.writerow(["hop", "ip", "city", "country", "lat", "lon", "avg_ms", "ms_bound", "asn", "org",
-                        "geo_src", "anycast", "suspect"])
+                        "geo_src", "confidence", "recovered", "anycast", "suspect"])
             for h in self._sorted_hops():
                 c, ct, la, lo, src = self._eff(h)
                 w.writerow([h.hop, h.ip, c, ct, la, lo, h.ms if h.ms is not None else "",
-                            1 if h.ms_bound else 0, h.asn, h.org, src, 1 if h.anycast else 0, 1 if h.ip in sus else 0])
+                            1 if h.ms_bound else 0, h.asn, h.org, src, self._conf(h, sus, consistent),
+                            1 if h.recovered else 0, 1 if h.anycast else 0, 1 if h.ip in sus else 0])
 
     def _save_json(self):
         if not self.hops:
@@ -2185,13 +2425,13 @@ class GeoTraceApp(tk.Tk):
                                             initialfile=f"trace_{clean_target(self.entry.get())}.json")
         if not path:
             return
-        sus = self._audit_sus()
+        sus, consistent = self._audit_sus()
         hops = []
         for h in self._sorted_hops():
             d = asdict(h)  # copy, not a reference to h.__dict__ — must not mutate the live hop
             c, ct, la, lo, src = self._eff(h)
             d.update({"eff_city": c, "eff_country": ct, "eff_lat": la, "eff_lon": lo,
-                      "geo_src": src, "suspect": h.ip in sus})
+                      "geo_src": src, "confidence": self._conf(h, sus, consistent), "suspect": h.ip in sus})
             hops.append(d)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"target": self.entry.get().strip(), "ping": self.ping_summary,
@@ -2230,7 +2470,7 @@ class GeoTraceApp(tk.Tk):
             "src_learned": L["m_src_learned"], "src_whois": L["m_src_whois"],
             "src_near": L["m_src_near"], "src_ixp": L["m_src_ixp"],
             "role_transit": L["m_role_transit"], "role_edge": L["m_role_edge"],
-            "sus": L["m_sus"], "anycast": L["m_anycast"],
+            "sus": L["m_sus"], "anycast": L["m_anycast"], "recovered": L["m_recovered"],
             "pin": L["m_pin"], "unpin": L["m_unpin"],
         }
         html = """<!DOCTYPE html>
@@ -2268,6 +2508,8 @@ class GeoTraceApp(tk.Tk):
         .tt-org { margin: 2px 0 0 30px; font-size: 11px; color: #8b93a7; white-space: normal; overflow-wrap: break-word; }
         .tt-sus { margin: 2px 0 0 30px; font-size: 10.5px; color: #fbbf24; }
         .tt-anycast { margin: 2px 0 0 30px; font-size: 10.5px; color: #a78bfa; }
+        .tt-recovered { margin: 2px 0 0 30px; font-size: 10.5px; color: #4dd0e1; }
+        .tt-conf { font-family: Consolas, monospace; font-size: 10px; opacity: .85; cursor: help; }
         .tt-seam { display: flex; align-items: center; gap: 6px; margin: 4px 2px; font-size: 10.5px; color: #fbbf24; }
         .tt-seam::before, .tt-seam::after { content: ""; flex: 1; border-top: 1px dashed rgba(251,191,36,.4); }
         .tt-footer { margin-top: 6px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,.08); font-size: 10.5px; color: #8b93a7; }
@@ -2384,6 +2626,16 @@ class GeoTraceApp(tk.Tk):
                    (it.src === 'near' ? LSTR.src_near :
                    (it.src === 'ixp' ? LSTR.src_ixp : LSTR.src_geo))));
         }
+        function confBadge(it) {
+            // consensus confidence from GeoTraceApp._eff()'s weighted-vote city resolution —
+            // how much of the total signal weight (PTR/whois/IXP/GeoIP/near-inherit) backs
+            // the winning answer, not just which signal happened to win
+            if (it.conf == null) return '';
+            var pct = Math.round(it.conf * 100);
+            var color = it.conf >= 0.8 ? '#66bb6a' : (it.conf >= 0.6 ? '#fbbf24' : '#ef5350');
+            var note = it.conf_note ? ' title="' + esc(it.conf_note) + '"' : '';
+            return ' · <span class="tt-conf" style="color:' + color + '"' + note + '>' + pct + '%</span>';
+        }
         function buildTooltip(m) {
             var first = m.items[0];
             var head = esc(first.city);
@@ -2408,11 +2660,12 @@ class GeoTraceApp(tk.Tk):
                         '<div class="tt-org">' +
                         (multiCity ? esc(it.city) + ' · ' : '') +
                         (it.org ? esc(it.org) + (it.asn ? ' · ' + esc(it.asn) : '') + ' · ' : '') +
-                        srcLabel(it) +
+                        srcLabel(it) + confBadge(it) +
                         (it.role === 'transit' ? ' · ' + LSTR.role_transit :
                          (it.role === 'edge' ? ' · ' + LSTR.role_edge : '')) + '</div>' +
                         (it.anycast ? '<div class="tt-anycast">' + LSTR.anycast + '</div>' :
                          (it.sus ? '<div class="tt-sus">' + LSTR.sus + '</div>' : '')) +
+                        (it.recovered ? '<div class="tt-recovered">' + LSTR.recovered + '</div>' : '') +
                         '</div></div>';
             });
             if (API_PORT) html += '<div class="tt-footer">' + LSTR.footer + '</div>';
@@ -3043,7 +3296,7 @@ document.addEventListener('click', function (e) {
 
     def _build_payload(self, final: bool) -> dict:
         sorted_hops = self._sorted_hops()
-        sus = self._audit_sus()
+        sus, consistent = self._audit_sus()
         eff = {h.ip: self._eff(h) for h in sorted_hops}
 
         line_lon = [eff[h.ip][3] for h in sorted_hops]
@@ -3095,6 +3348,11 @@ document.addEventListener('click', function (e) {
                     line += f" · {h.org} ({h.asn})"
                 src_sym = {"ixp": "⚡", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍"}.get(src, "🛰")
                 line += f" · {src_sym}"
+                conf = self._conf(h, sus, consistent)
+                if conf < 0.6:
+                    line += f" · {conf:.0%}"
+                if h.recovered:
+                    line += " · 🔧"
                 if h.anycast:
                     line += " · 🌐"
                 if h.ip in sus:
@@ -3112,7 +3370,9 @@ document.addEventListener('click', function (e) {
                 "items": [
                     {"hop": h.hop, "ip": h.ip, "city": eff[h.ip][0], "country": eff[h.ip][1],
                      "user": h.hop == 0, "ms": h.ms, "ms_bound": h.ms_bound, "asn": h.asn, "org": h.org,
-                     "src": eff[h.ip][4], "role": h.role, "sus": h.ip in sus, "anycast": h.anycast}
+                     "src": eff[h.ip][4], "conf": self._conf(h, sus, consistent),
+                     "conf_note": self._conf_note(h, sus, consistent, eff[h.ip][4]), "role": h.role,
+                     "sus": h.ip in sus, "anycast": h.anycast, "recovered": h.recovered}
                     for h in hops
                 ],
                 "copy": "\n────────────\n".join(copy_lines),
