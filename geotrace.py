@@ -1754,41 +1754,41 @@ if GUI_AVAILABLE:
             self.trace_timeout = 2.0     # Таймаут в секундах
             self.trace_interval = 0.05   # Интервал между зондами (сек)
 
-        prefs = load_settings()
-        self.theme = prefs.get("theme", "light")
-        if self.theme not in THEMES:
-            self.theme = "light"
-        self.lang = prefs.get("lang", "ru")
-        if self.lang not in LANGS:
-            self.lang = "ru"
-        self.learn_mode = prefs.get("learn", "off")
-        if self.learn_mode not in ("off", "semi", "auto"):
-            self.learn_mode = "off"
-        self.history = prefs.get("history", [])
-        if not isinstance(self.history, list):
-            self.history = []
-        self.tracing = False
-        self.ptr_attempts = 0
-        self.ptr_matches = 0
+            prefs = load_settings()
+            self.theme = prefs.get("theme", "light")
+            if self.theme not in THEMES:
+                self.theme = "light"
+            self.lang = prefs.get("lang", "ru")
+            if self.lang not in LANGS:
+                self.lang = "ru"
+            self.learn_mode = prefs.get("learn", "off")
+            if self.learn_mode not in ("off", "semi", "auto"):
+                self.learn_mode = "off"
+            self.history = prefs.get("history", [])
+            if not isinstance(self.history, list):
+                self.history = []
+            self.tracing = False
+            self.ptr_attempts = 0
+            self.ptr_matches = 0
 
-        self.learner = GeoLearner(CONFIG["learn_file"])
-        self.suggest_queue = []
-        self.suggest_open = False
+            self.learner = GeoLearner(CONFIG["learn_file"])
+            self.suggest_queue = []
+            self.suggest_open = False
 
-        self.bgp = BgpInfo(CONFIG["peeringdb_file"])
-        threading.Thread(target=self.bgp.refresh, daemon=True).start()
+            self.bgp = BgpInfo(CONFIG["peeringdb_file"])
+            threading.Thread(target=self.bgp.refresh, daemon=True).start()
 
-        self.ping_manager = PingManager(lang=self.lang)
-        self.api_port = 0
-        self.api_token = secrets.token_urlsafe(24)
-        try:
-            self.api_port, _ = _start_api_server(self.ping_manager, self.api_token)
-        except Exception:
-            pass
+            self.ping_manager = PingManager(lang=self.lang)
+            self.api_port = 0
+            self.api_token = secrets.token_urlsafe(24)
+            try:
+                self.api_port, _ = _start_api_server(self.ping_manager, self.api_token)
+            except Exception:
+                pass
 
-        self._setup_ui()
-        self._apply_theme(self.theme, save=False)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+            self._setup_ui()
+            self._apply_theme(self.theme, save=False)
+            self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------- i18n
     def tr(self, key, *args, **kw):
