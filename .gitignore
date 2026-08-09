@@ -1,1 +1,1 @@
-Nothing needs to be added to .gitignore since only a markdown file (README_EN.md) was added, which is a source/config file and should not be ignored.
+Nothing needs to be added to .gitignore since the changes only include Python source files (.py) and the existing .gitignore is empty. No build artifacts, dependencies, or temporary files are present in the change list.

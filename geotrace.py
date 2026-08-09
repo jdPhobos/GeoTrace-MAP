@@ -11,10 +11,12 @@ import json
 import time
 import secrets
 import ipaddress
+import statistics
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, asdict
-from typing import Optional, Callable, List
+from dataclasses import dataclass, asdict, field
+from typing import Optional, Callable, List, Dict, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import defaultdict
 
 import requests
 import tkinter as tk
@@ -526,10 +528,13 @@ class GeoPoint:
     country: str
     lat: float
     lon: float
-    ms: Optional[float] = None
-    ms_min: Optional[float] = None
-    ms_bound: bool = False   # True if the traceroute reading was an upper bound ("<1 ms"),
-                              # not a tight measurement — see rtt_pattern parsing below
+    ms: Optional[float] = None       # Средний RTT (мс)
+    ms_min: Optional[float] = None   # Минимальный RTT (мс)
+    ms_max: Optional[float] = None   # Максимальный RTT (мс) - НОВОЕ
+    jitter: Optional[float] = None   # Джиттер (мс) - НОВОЕ
+    loss_percent: float = 0.0        # Процент потерь - НОВОЕ
+    probes_sent: int = 0             # Количество отправленных зондов - НОВОЕ
+    ms_bound: bool = False           # True если значение верхней границы ("<1 ms")
     asn: str = ""
     org: str = ""
     src: str = "geo"
@@ -538,10 +543,9 @@ class GeoPoint:
     anycast: bool = False
     ixp: Optional[dict] = None
     role: str = ""
-    geo_agree: bool = False  # True if both independent GeoIP providers agreed
-    recovered: bool = False  # True if this hop timed out under the main trace and was
-                              # recovered by a supplementary TCP-SYN probe (see
-                              # trace_worker's post-trace fallback pass, POSIX only)
+    geo_agree: bool = False          # True если оба GeoIP провайдера согласны
+    recovered: bool = False          # True если хоп восстановлен через TCP-SYN
+    hidden: bool = False             # True если это скрытый узел - НОВОЕ
 
 
 class GeoLearner:
@@ -1158,7 +1162,8 @@ def trace_worker(target, callback, stop_event, app):
                 out["role"] = role
         return out
 
-    def submit_geo(ip, hop, ms, ms_min, ms_bound=False, recovered=False):
+    def submit_geo(ip, hop, ms, ms_min, ms_bound=False, recovered=False, 
+                   ms_max=None, jitter=None, loss_percent=0.0, probes_sent=0):
         try:
             fut = executor.submit(get_ip_geo, ip)
         except RuntimeError:
@@ -1175,6 +1180,10 @@ def trace_worker(target, callback, stop_event, app):
                 g.hop = hop
                 g.ms = ms
                 g.ms_min = ms_min
+                g.ms_max = ms_max
+                g.jitter = jitter
+                g.loss_percent = loss_percent
+                g.probes_sent = probes_sent
                 g.ms_bound = ms_bound
                 g.recovered = recovered
                 g.anycast = is_anycast(g.asn, g.org)
@@ -1280,9 +1289,24 @@ def trace_worker(target, callback, stop_event, app):
                     if m.group(1):
                         any_bound = True  # "<Xms" — an upper bound, not a tight measurement
                     rtts.append(v)
+                
+                # Расчет статистики как у PingPlotter
                 avg_ms = round(sum(rtts) / len(rtts), 1) if rtts else None
                 min_ms = round(min(rtts), 1) if rtts else None
-                submit_geo(ip, hop_index, avg_ms, min_ms, any_bound)
+                max_ms = round(max(rtts), 1) if len(rtts) > 1 else None
+                
+                # Расчет джиттера (среднее отклонение между последовательными RTT)
+                jitter = None
+                if len(rtts) > 1:
+                    diffs = [abs(rtts[i] - rtts[i-1]) for i in range(1, len(rtts))]
+                    jitter = round(sum(diffs) / len(diffs), 2) if diffs else None
+                
+                # Процент потерь (в базовом режиме пока 0, т.к. системный traceroute не дает полной статистики)
+                loss_pct = 0.0
+                probes = len(rtts)
+                
+                submit_geo(ip, hop_index, avg_ms, min_ms, any_bound, 
+                          ms_max=max_ms, jitter=jitter, loss_percent=loss_pct, probes_sent=probes)
                 submit_ptr(ip)
                 if raw_ttl is not None:
                     ttl_hop_map[raw_ttl] = hop_index
@@ -1352,9 +1376,16 @@ def trace_worker(target, callback, stop_event, app):
                 if not res:
                     return
                 ip, avg_ms, min_ms = res
+                # Для восстановленных хопов также считаем статистику
+                max_ms = min_ms  # Только одно значение
+                jitter = None
+                loss_pct = 0.0
+                probes = 1
+                
                 frac_hop = (ttl_hop_map[lower] +
                            (ttl_hop_map[upper] - ttl_hop_map[lower]) * (ttl - lower) / (upper - lower))
-                submit_geo(ip, frac_hop, avg_ms, min_ms, False, True)
+                submit_geo(ip, frac_hop, avg_ms, min_ms, False, True,
+                          ms_max=max_ms, jitter=jitter, loss_percent=loss_pct, probes_sent=probes)
                 submit_ptr(ip)
             fut.add_done_callback(on_recovered)
         recover_executor.shutdown(wait=True)
@@ -1386,6 +1417,11 @@ class GeoTraceApp(tk.Tk):
         self.data_rev = 0
         self.trace_stats = None
         self.hist_win = None
+        
+        # Настройки улучшенной трассировки (как у PingPlotter)
+        self.trace_probes = 20       # Количество зондов на хоп
+        self.trace_timeout = 2.0     # Таймаут в секундах
+        self.trace_interval = 0.05   # Интервал между зондами (сек)
 
         prefs = load_settings()
         self.theme = prefs.get("theme", "light")
