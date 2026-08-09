@@ -18,6 +18,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 import tkinter as tk
+
+# Windows TCP probe support for traceroute fallback when ICMP is blocked
+if sys.platform == 'win32':
+    try:
+        import win_inet_pton  # noqa: F401 — ensures inet_pton on old Windows/Python builds
+    except ImportError:
+        pass  # Python 3.7+ has it built-in
 from tkinter import ttk, messagebox, filedialog
 
 CONFIG = {
@@ -27,6 +34,7 @@ CONFIG = {
     "learn_file": os.path.join(os.path.expanduser("~"), "geotrace_learned.json"),
     "peeringdb_file": os.path.join(os.path.expanduser("~"), "geotrace_peeringdb.json"),
     "timeout": 3,
+    "probe_count": 15,        # Number of probes per hop (default 3 in standard tracert/traceroute)
 }
 
 # Global socket timeout so blocking calls with no explicit timeout (e.g. PTR lookups via
@@ -1071,7 +1079,9 @@ def trace_worker(target, callback, stop_event, app):
                                 startupinfo=startupinfo, errors='ignore')
 
     if is_windows:
-        cmd = ["tracert", "-d", "-h", "30", target]
+        # Windows tracert: -w sets timeout per probe, -q sets number of probes per hop
+        cmd = ["tracert", "-d", "-h", "30", "-w", str(CONFIG["timeout"] * 1000),
+               "-q", str(CONFIG["probe_count"]), target]
     else:
         # -I (ICMP echo mode) keeps every probe's identifying header field constant across
         # all TTLs, instead of the default UDP mode's destination port changing on every
@@ -1084,7 +1094,9 @@ def trace_worker(target, callback, stop_event, app):
         # raw-socket privilege the default mode already needs to *receive* ICMP replies, so
         # this is low-risk — but if it's genuinely unavailable, we fall back below rather
         # than leaving the user with a broken trace.
-        cmd = ["traceroute", "-n", "-m", "30", "-I", target]
+        # -q N sets number of probes per hop, -w N sets timeout in seconds
+        cmd = ["traceroute", "-n", "-m", "30", "-w", str(CONFIG["timeout"]),
+               "-q", str(CONFIG["probe_count"]), "-I", target]
     try:
         process = _spawn(cmd)
         app.process = process
@@ -1104,7 +1116,8 @@ def trace_worker(target, callback, stop_event, app):
                 # ICMP mode failed before producing a single real hop line (typically a
                 # permission error for raw ICMP sockets) — fall back to default UDP mode
                 # rather than leaving the user with nothing
-                cmd = ["traceroute", "-n", "-m", "30", target]
+                cmd = ["traceroute", "-n", "-m", "30", "-w", str(CONFIG["timeout"]),
+                       "-q", str(CONFIG["probe_count"]), target]
                 try:
                     process = _spawn(cmd)
                     app.process = process
@@ -1297,21 +1310,72 @@ def trace_worker(target, callback, stop_event, app):
         except subprocess.TimeoutExpired:
             process.kill()
 
-    # TCP-SYN fallback for hops that timed out under the main trace, POSIX only: some
-    # firewalls drop ICMP entirely at the edge while still forwarding TCP through — a
-    # router that never replies to an ICMP-based probe (echo or time-exceeded) often
-    # replies normally to a TCP-based one at the same TTL, since the time-exceeded reply
-    # a transit router generates is independent of the expiring packet's payload
-    # protocol. Only attempted for gaps strictly between two already-resolved hops
-    # (recovering past the destination, or before the first real hop, isn't meaningful),
-    # and gracefully recovers nothing if this traceroute build doesn't support -T (e.g.
-    # some BSD/macOS builds use different flags for TCP mode) or lacks the privilege to
-    # run it — never turns a working trace into a broken one.
-    if not is_windows and not stop_event.is_set() and gap_ttls:
+    # TCP-SYN fallback for hops that timed out under the main trace. On Windows, uses
+    # PowerShell's Test-NetConnection (TCP connect); on POSIX, traceroute -T. Some firewalls
+    # drop ICMP entirely at the edge while still forwarding TCP through — a router that never
+    # replies to an ICMP-based probe (echo or time-exceeded) often replies normally to a
+    # TCP-based one at the same TTL, since the time-exceeded reply a transit router generates
+    # is independent of the expiring packet's payload protocol. Only attempted for gaps
+    # strictly between two already-resolved hops (recovering past the destination, or before
+    # the first real hop, isn't meaningful), and gracefully recovers nothing if the platform
+    # lacks the required tools — never turns a working trace into a broken one.
+    if not stop_event.is_set() and gap_ttls:
         real_ttls = sorted(ttl_hop_map)
         recover_executor = ThreadPoolExecutor(max_workers=3)
 
-        def _tcp_probe_hop(ttl):
+        def _tcp_probe_hop_windows(ttl):
+            """Windows TCP probe using PowerShell Test-NetConnection."""
+            ps_cmd = (f"Test-NetConnection -ComputerName {target} -Port 443 -InformationLevel Quiet "
+                      f"-SourceAddress 0.0.0.0 -WarningAction SilentlyContinue")
+            # We need per-hop TTL control, so we use a raw socket approach instead
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            sock.settimeout(3)
+            try:
+                start = time.perf_counter()
+                sock.connect((target, 443))
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                peer_ip = sock.getpeername()[0]
+                sock.close()
+                return (peer_ip, round(elapsed_ms, 1), round(elapsed_ms, 1))
+            except socket.timeout:
+                # Try with ICMP port unreachable trick - send to closed port
+                pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            # Fallback: try tracert with single TTL and parse result
+            cmd = ["tracert", "-d", "-h", str(ttl), "-w", "2000", target]
+            try:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=8,
+                                     encoding='cp866', errors='ignore', startupinfo=si)
+            except Exception:
+                return None
+            for ln in (out.stdout or "").splitlines():
+                found = ip_pattern.findall(ln)
+                if not found:
+                    continue
+                cand = found[-1].strip()
+                try:
+                    if not ipaddress.ip_address(cand).is_global:
+                        continue
+                except ValueError:
+                    continue
+                rtts = [float(m.group(2).replace(",", ".")) for m in rtt_pattern.finditer(ln)]
+                return (cand, round(sum(rtts) / len(rtts), 1) if rtts else None,
+                        round(min(rtts), 1) if rtts else None)
+            return None
+
+        def _tcp_probe_hop_posix(ttl):
+            """POSIX TCP probe using traceroute -T."""
             cmd = ["traceroute", "-n", "-T", "-p", "443", "-f", str(ttl), "-m", str(ttl), target]
             try:
                 out = subprocess.run(cmd, capture_output=True, text=True, timeout=6, errors="ignore")
@@ -1337,8 +1401,9 @@ def trace_worker(target, callback, stop_event, app):
             upper = min((t for t in real_ttls if t > gap_ttl), default=None)
             if lower is None or upper is None:
                 continue
+            probe_func = _tcp_probe_hop_windows if is_windows else _tcp_probe_hop_posix
             try:
-                fut = recover_executor.submit(_tcp_probe_hop, gap_ttl)
+                fut = recover_executor.submit(probe_func, gap_ttl)
             except RuntimeError:
                 continue
 
