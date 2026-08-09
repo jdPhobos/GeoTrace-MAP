@@ -1749,10 +1749,10 @@ if GUI_AVAILABLE:
             self.trace_stats = None
             self.hist_win = None
         
-        # Настройки улучшенной трассировки (как у PingPlotter)
-        self.trace_probes = 20       # Количество зондов на хоп
-        self.trace_timeout = 2.0     # Таймаут в секундах
-        self.trace_interval = 0.05   # Интервал между зондами (сек)
+            # Настройки улучшенной трассировки (как у PingPlotter)
+            self.trace_probes = 20       # Количество зондов на хоп
+            self.trace_timeout = 2.0     # Таймаут в секундах
+            self.trace_interval = 0.05   # Интервал между зондами (сек)
 
         prefs = load_settings()
         self.theme = prefs.get("theme", "light")
