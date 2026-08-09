@@ -34,7 +34,9 @@ CONFIG = {
     "learn_file": os.path.join(os.path.expanduser("~"), "geotrace_learned.json"),
     "peeringdb_file": os.path.join(os.path.expanduser("~"), "geotrace_peeringdb.json"),
     "timeout": 3,
-    "probe_count": 15,        # Number of probes per hop (default 3 in standard tracert/traceroute)
+    "probe_count": 10,        # Number of probes per hop (Windows tracert always uses 3, we loop)
+    "tcp_port": 80,           # Default TCP port for TCP traceroute fallback
+    "use_tcp_trace": False,   # Enable TCP traceroute when ICMP is blocked
 }
 
 # Global socket timeout so blocking calls with no explicit timeout (e.g. PTR lookups via
@@ -1062,6 +1064,95 @@ def _start_api_server(manager, token):
     return port, server
 
 
+def _windows_multi_tracert(target, timeout_ms, num_probes, stop_event):
+    """
+    Run multiple Windows tracert commands and merge results to simulate -q flag.
+    Windows tracert always sends 3 probes per run, so we run it ceil(num_probes/3) times.
+    Returns merged output lines or None on error.
+    """
+    import math
+    runs_needed = max(1, math.ceil(num_probes / 3))
+    all_lines = {}  # hop_num -> list of (rtt1, rtt2, rtt3, ip) tuples
+    
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    
+    for run in range(runs_needed):
+        if stop_event.is_set():
+            break
+        cmd = ["tracert", "-d", "-h", "30", "-w", str(timeout_ms), target]
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                 encoding='cp866', errors='ignore', startupinfo=si)
+        except Exception as e:
+            if run == 0:
+                return None
+            continue
+        
+        ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+        rtt_pattern = re.compile(r'(<)?\s*(\d+(?:[.,]\d+)?)\s*(?:ms|мс)', re.I)
+        
+        for ln in (out.stdout or "").splitlines():
+            # Parse hop line: "  1    <1 ms    <1 ms    <1 ms  192.168.0.1"
+            match = re.match(r'^\s*(\d+)\s+', ln)
+            if not match:
+                continue
+            hop_num = int(match.group(1))
+            found = ip_pattern.findall(ln)
+            if not found:
+                # Timeout hop: "  7     *        *        *     Превышен интервал..."
+                if hop_num not in all_lines:
+                    all_lines[hop_num] = []
+                all_lines[hop_num].append((None, None, None, None))
+                continue
+            ip = found[-1].strip()
+            rtts = [float(m.group(2).replace(",", ".")) for m in rtt_pattern.finditer(ln)]
+            # Pad to 3 RTTs if needed
+            while len(rtts) < 3:
+                rtts.append(None)
+            if hop_num not in all_lines:
+                all_lines[hop_num] = []
+            all_lines[hop_num].append((rtts[0], rtts[1], rtts[2], ip))
+    
+    # Merge results into unified output format
+    merged_lines = []
+    for hop_num in sorted(all_lines.keys()):
+        probes = all_lines[hop_num]
+        # Collect all IPs and RTTs
+        all_ips = set()
+        all_rtts = []
+        for p in probes:
+            if p[3]:  # IP
+                all_ips.add(p[3])
+            for r in p[:3]:
+                if r is not None:
+                    all_rtts.append(r)
+        
+        # Choose most common IP (or first if tie)
+        ip_counts = {}
+        for p in probes:
+            if p[3]:
+                ip_counts[p[3]] = ip_counts.get(p[3], 0) + 1
+        chosen_ip = max(ip_counts.keys(), key=lambda x: ip_counts[x]) if ip_counts else "*"
+        
+        # Calculate min/avg/max RTT for display
+        if all_rtts:
+            min_rtt = min(all_rtts)
+            avg_rtt = sum(all_rtts) / len(all_rtts)
+            max_rtt = max(all_rtts)
+            rtt_str = f"{min_rtt:.0f} ms   {avg_rtt:.0f} ms   {max_rtt:.0f} ms"
+        else:
+            rtt_str = "  *         *         *     "
+        
+        merged_lines.append(f"{hop_num:3d}   {rtt_str}  {chosen_ip}")
+    
+    return merged_lines if merged_lines else None
+
+
 def trace_worker(target, callback, stop_event, app):
     L = LANGS[app.lang]
     callback("log", L["log_geo"])
@@ -1078,10 +1169,32 @@ def trace_worker(target, callback, stop_event, app):
                                 text=True, encoding='cp866' if is_windows else 'utf-8',
                                 startupinfo=startupinfo, errors='ignore')
 
+    process = None
+    merged_output = None
+    
     if is_windows:
-        # Windows tracert: -w sets timeout per probe, -q sets number of probes per hop
-        cmd = ["tracert", "-d", "-h", "30", "-w", str(CONFIG["timeout"] * 1000),
-               "-q", str(CONFIG["probe_count"]), target]
+        # Windows tracert does NOT support -q flag. It always sends exactly 3 probes per hop.
+        # To get more probes, we run tracert multiple times and merge results.
+        num_probes = CONFIG["probe_count"]
+        timeout_ms = CONFIG["timeout"] * 1000
+        merged_lines = _windows_multi_tracert(target, timeout_ms, num_probes, stop_event)
+        if merged_lines:
+            merged_output = "\n".join(merged_lines)
+            # Create a fake Popen-like object for compatibility
+            class FakeProcess:
+                def __init__(self, output):
+                    self._output = output
+                    self._file = None
+                def stdout(self):
+                    return self
+                def __iter__(self):
+                    return iter(self._output.splitlines())
+                def poll(self):
+                    return 0
+            process = FakeProcess(merged_output)
+        else:
+            callback("error", L["util_fail"].format("Failed to run tracert"))
+            return
     else:
         # -I (ICMP echo mode) keeps every probe's identifying header field constant across
         # all TTLs, instead of the default UDP mode's destination port changing on every
@@ -1097,33 +1210,33 @@ def trace_worker(target, callback, stop_event, app):
         # -q N sets number of probes per hop, -w N sets timeout in seconds
         cmd = ["traceroute", "-n", "-m", "30", "-w", str(CONFIG["timeout"]),
                "-q", str(CONFIG["probe_count"]), "-I", target]
-    try:
-        process = _spawn(cmd)
-        app.process = process
-    except Exception as e:
-        callback("error", L["util_fail"].format(e))
-        return
+        try:
+            process = _spawn(cmd)
+            app.process = process
+        except Exception as e:
+            callback("error", L["util_fail"].format(e))
+            return
 
-    if not is_windows and "-I" in cmd:
-        time.sleep(0.3)
-        if process.poll() is not None:
-            early = ""
-            try:
-                early = process.stdout.read(2000) or ""
-            except Exception:
-                pass
-            if not re.search(r'^\s*\d+\s', early, re.M):
-                # ICMP mode failed before producing a single real hop line (typically a
-                # permission error for raw ICMP sockets) — fall back to default UDP mode
-                # rather than leaving the user with nothing
-                cmd = ["traceroute", "-n", "-m", "30", "-w", str(CONFIG["timeout"]),
-                       "-q", str(CONFIG["probe_count"]), target]
+        if not is_windows and "-I" in cmd:
+            time.sleep(0.3)
+            if process.poll() is not None:
+                early = ""
                 try:
-                    process = _spawn(cmd)
-                    app.process = process
-                except Exception as e:
-                    callback("error", L["util_fail"].format(e))
-                    return
+                    early = process.stdout.read(2000) or ""
+                except Exception:
+                    pass
+                if not re.search(r'^\s*\d+\s', early, re.M):
+                    # ICMP mode failed before producing a single real hop line (typically a
+                    # permission error for raw ICMP sockets) — fall back to default UDP mode
+                    # rather than leaving the user with nothing
+                    cmd = ["traceroute", "-n", "-m", "30", "-w", str(CONFIG["timeout"]),
+                           "-q", str(CONFIG["probe_count"]), target]
+                    try:
+                        process = _spawn(cmd)
+                        app.process = process
+                    except Exception as e:
+                        callback("error", L["util_fail"].format(e))
+                        return
 
     # собственный IP определяем, пока процесс уже «греется»
     if my_ip := get_public_ip():
