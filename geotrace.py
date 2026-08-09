@@ -21,8 +21,18 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import defaultdict
 
 import requests
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+
+# Попытка импорта GUI библиотек
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+    GUI_AVAILABLE = True
+except ImportError:
+    GUI_AVAILABLE = False
+    tk = None
+    ttk = None
+    messagebox = None
+    filedialog = None
 
 CONFIG = {
     "map_file": os.path.join(os.path.expanduser("~"), "desktop_trace_map.html"),
@@ -1718,25 +1728,26 @@ def trace_worker(target, callback, stop_event, app):
              {"target": target, "global": hop_index - 1,
               "total": total_lines, "timeout": timeout_lines})
 
-class GeoTraceApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("GeoTrace MAP")
-        self.geometry("560x646")
+if GUI_AVAILABLE:
+    class GeoTraceApp(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("GeoTrace MAP")
+            self.geometry("560x646")
 
-        self.hops: List[GeoPoint] = []
-        self._live_rtt = {}   # ip -> min RTT (ms) from an active continuous-ping session,
-                                # refreshed each _audit_sus() pass — see PingManager.live_min_rtts
-        self._eff_conf = {}   # ip -> consensus confidence (0-1) from the last _eff() call,
-                                # populated as a side effect so callers can display it
-        self.map_opened = False
-        self.process: Optional[subprocess.Popen] = None
-        self.stop_event = threading.Event()
-        self.ping_summary = ""
-        self.map_rev = 0
-        self.data_rev = 0
-        self.trace_stats = None
-        self.hist_win = None
+            self.hops: List[GeoPoint] = []
+            self._live_rtt = {}   # ip -> min RTT (ms) from an active continuous-ping session,
+                                    # refreshed each _audit_sus() pass — see PingManager.live_min_rtts
+            self._eff_conf = {}   # ip -> consensus confidence (0-1) from the last _eff() call,
+                                    # populated as a side effect so callers can display it
+            self.map_opened = False
+            self.process: Optional[subprocess.Popen] = None
+            self.stop_event = threading.Event()
+            self.ping_summary = ""
+            self.map_rev = 0
+            self.data_rev = 0
+            self.trace_stats = None
+            self.hist_win = None
         
         # Настройки улучшенной трассировки (как у PingPlotter)
         self.trace_probes = 20       # Количество зондов на хоп
@@ -3788,4 +3799,12 @@ document.addEventListener('click', function (e) {
 
 
 if __name__ == "__main__":
-    GeoTraceApp().mainloop()
+    if GUI_AVAILABLE:
+        GeoTraceApp().mainloop()
+    else:
+        print("Ошибка: GUI интерфейс (tkinter) недоступен.")
+        print("Для запуска GEOTracer с графическим интерфейсом установите tkinter:")
+        print("  - На Ubuntu/Debian: sudo apt-get install python3-tk")
+        print("  - На Fedora: sudo dnf install python3-tkinter")
+        print("  - На macOS: brew install python-tk")
+        print("\nИли используйте программу в режиме командной строки.")
