@@ -60,25 +60,17 @@ subprocess.STARTUPINFO, os.startfile
 стандартная библиотека Python, ставить ничего не нужно.
 
 ### tkinter (графический интерфейс)
-- **Windows / macOS**: входит в официальный установщик Python.
-- **Linux**: обычно ставится отдельно:
-  - Debian/Ubuntu: `sudo apt install python3-tk`
-  - Fedora: `sudo dnf install python3-tkinter`
-  - Arch: `sudo pacman -S tk`
+- Входит в официальный установщик Python.
 
 ### Системные утилиты
-- **Windows**: `tracert` и `ping` встроены; `curl` присутствует в Windows 10+
+- `tracert` и `ping` встроены; `curl` присутствует в Windows 10+
   (нужен только для TCP-фолбэка — при его отсутствии программа просто
   пропускает этот шаг).
-- **Linux**: `sudo apt install traceroute iputils-ping curl`
-  (`ping` обычно уже установлен).
 
 ### Быстрая проверка
 ```bash
 python -c "import tkinter, requests; print('OK')"
 ```
-- Windows: `tracert` встроен; `curl` обычно присутствует (нужен только для
-  TCP-ping фолбэка).
 
 ### Запуск
 ```bash
