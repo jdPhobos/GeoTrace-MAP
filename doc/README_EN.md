@@ -30,23 +30,15 @@ Requires **Python 3.8+**
 Everything else (`tkinter`, `subprocess`, `json`, `socket`, `http.server`, etc.) is Python standard library — no installation needed.
 
 ### tkinter (GUI)
-- **Windows / macOS**: included in the official Python installer.
-- **Linux**: usually installed separately:
-  - Debian/Ubuntu: `sudo apt install python3-tk`
-  - Fedora: `sudo dnf install python3-tkinter`
-  - Arch: `sudo pacman -S tk`
+- Included in the official Python installer.
 
 ### System utilities
-- **Windows**: `tracert` and `ping` are built-in; `curl` is available in Windows 10+ (only needed for TCP fallback — if missing, the program simply skips this step).
-- **Linux**: `sudo apt install traceroute iputils-ping curl` (`ping` is usually already installed).
+- `tracert` and `ping` are built-in; `curl` is available in Windows 10+ (only needed for TCP fallback — if missing, the program simply skips this step).
 
 ### Quick check
 ```bash
 python -c "import tkinter, requests; print('OK')"
 ```
-
-- Windows: `tracert` is built-in; `curl` is usually present (only needed for TCP-ping fallback).
-- Linux: install `traceroute` (`sudo apt install traceroute`).
 
 ## Launch
 
