@@ -1,5 +1,6 @@
 # GeoTrace MAP
-🇷🇺[Русский](../README.md)
+> [!TIP]
+> [Описание на Русском](../README.md)
 
 Desktop tool for visualizing network routes on a world map with multi-source node geolocation.
 
