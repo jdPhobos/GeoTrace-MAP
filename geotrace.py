@@ -1,23 +1,24 @@
-import csv
-import datetime
-import ipaddress
-import json
-import math
 import os
-import re
-import secrets
-import socket
-import subprocess
 import sys
+import re
+import csv
+import math
+import socket
+import datetime
+import subprocess
 import threading
+import json
 import time
-import tkinter as tk
+import secrets
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from tkinter import filedialog, messagebox, ttk
+from dataclasses import dataclass, asdict
+from typing import Optional, Callable, List
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 
 CONFIG = {
     "map_file": os.path.join(os.path.expanduser("~"), "desktop_trace_map.html"),
@@ -228,13 +229,6 @@ def translate_city(city: str, country: str, lang: str) -> tuple:
     return city, COUNTRY_TRANSLATIONS.get(country, country)
 
 
-def strip_as_prefix(asn) -> str:
-    """Strip a leading 'AS'/'as' prefix from an ASN string. Unlike str.lstrip(), this
-    removes only the literal two-character prefix, not any leading run of 'A'/'S' chars."""
-    s = str(asn or "").strip().upper()
-    return re.sub(r'^AS', '', s)
-
-
 def haversine(lat1, lon1, lat2, lon2):
     r = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -263,16 +257,13 @@ DETOUR_FACTOR = 1.4
 # weaker signals that agree can outrank a single stronger one that disagrees with everything
 # else, instead of a strict first-match priority chain.
 SRC_WEIGHT = {
-    "ixp": 5.0,
-    "facility": 4.5,
-    "host": 4.0,
-    "learned": 3.2,
-    "whois": 2.0,
-    "near": 1.6,
-    "rtt_override": 10.0,  # <--- Добавили (перебивает любые другие источники)
-    "geo_agree": 2.4,
-    "geo": 1.0,
-    "peeringdb": 3.5,
+    "ixp": 5.0,        # PeeringDB prefix match
+    "host": 4.0,       # PTR hostname city-code match
+    "learned": 3.2,    # locally-trained, multi-day-confirmed PTR match
+    "whois": 2.0,       # RIPEstat whois text city-code match
+    "near": 1.6,        # inherited from an adjacent hop with near-identical RTT
+    "geo_agree": 2.4,   # both independent GeoIP providers agree
+    "geo": 1.0,          # single GeoIP provider, no corroboration
 }
 
 # Ceiling used to normalize _eff()'s confidence score — deliberately NOT "however much
@@ -282,7 +273,7 @@ SRC_WEIGHT = {
 # which is backwards: no competing evidence isn't the same as strong evidence. Normalizing
 # against a fixed ceiling — the weight of two strong independent signals agreeing — means a
 # lone weak signal correctly reads as low confidence instead.
-CONFIDENCE_CEILING = SRC_WEIGHT["ixp"] + SRC_WEIGHT["facility"]
+CONFIDENCE_CEILING = SRC_WEIGHT["ixp"] + SRC_WEIGHT["host"]
 
 # Router-hostname naming conventions typically place a location code directly next to an
 # interface/role identifier (digits, or a short keyword like core/edge/gw/...), e.g.
@@ -293,7 +284,7 @@ ROUTER_ROLE_WORDS = ("core", "edge", "gw", "rtr", "router", "ix", "peer", "px", 
                      "backbone", "transit", "agg")
 
 
-def ptr_city_code(ip: str) -> tuple | None:
+def ptr_city_code(ip: str) -> Optional[tuple]:
     try:
         host = socket.gethostbyaddr(ip)[0]
     except Exception:
@@ -322,7 +313,7 @@ def ptr_city_code(ip: str) -> tuple | None:
     return None
 
 
-def ripestat_city_code(ip: str) -> tuple | None:
+def ripestat_city_code(ip: str) -> Optional[tuple]:
     try:
         resp = session.get(f"https://stat.ripe.net/data/whois/data?resource={ip}",
                            timeout=CONFIG["timeout"]).json()
@@ -361,7 +352,7 @@ ANYCAST_NETS = {
 
 
 def is_anycast(asn: str, org: str) -> bool:
-    asn_clean = strip_as_prefix(asn)
+    asn_clean = str(asn or "").upper().lstrip("AS")
     org_lower = str(org or "").lower()
     for key in ANYCAST_NETS:
         if key.isdigit() and asn_clean == key:
@@ -392,8 +383,6 @@ LANGS = {
         "report_title": "🌍 Маршрут до: {}", "report_ping": "📶 Пинг: {}",
         "report_copied": "Отчёт скопирован в буфер обмена",
         "html_saved": "Автономный HTML сохранён", "ms": "мс",
-        "m_recovered": "🔧 узел восстановлен TCP-пробой (ICMP был заблокирован)",
-        "m_target": "🎯 цель: нет ответа на traceroute (ICMP фильтруется)",
         "m_pin": "Закрепить — тултип можно таскать за шапку",
         "m_unpin": "Открепить и закрыть",
         "m_annot": "➜ направление движения: от вас к цели",
@@ -412,11 +401,9 @@ LANGS = {
         "m_src_learned": "🧠 обучено", "m_src_whois": "📜 whois",
         "m_src_near": "📍 рядом",
         "m_src_ixp": "⚡ IXP", "m_role_transit": "🛣️ транзит", "m_role_edge": "🏠 край сети",
-        "m_src_facility": "🏢 дата-центр",
-        "m_src_peeringdb": "🏢 HQ провайдера",
-        "m_src_rtt": "🧲 рядом по RTT",
         "m_sus": "⚠ геолокация противоречит задержке",
         "m_anycast": "🌐 anycast CDN: вы на ближайшем edge-узле, GeoIP не отражает реальную точку",
+        "m_recovered": "🔧 узел восстановлен TCP-пробой (ICMP был заблокирован)",
         "conf_intro": "Уверенность: сколько независимых источников подтверждают эту локацию.",
         "conf_you": "Это ваш узел — локация известна, а не выведена.",
         "conf_capped": "Снижено: задержка противоречит этой геолокации.",
@@ -440,7 +427,6 @@ LANGS = {
         "learn_ev_ok": "✓ задержка согласуется с расстоянием до {} (≈{} км)",
         "learn_ev_bad": "⚠ задержка {} мс слишком мала для {} км до {} — вероятно, ошибка",
         "hist_empty": "история пуста",
-        "report_skipped": "⊘ {} узел(ов) пропущено (приватные/таймауты)",
         "about_title": "О программе",
         "about_coding": "shitty vibe-coding with \n«Qwen3.8-Max»\n «Claude»",
     },
@@ -462,8 +448,6 @@ LANGS = {
         "report_title": "🌍 Route to: {}", "report_ping": "📶 Ping: {}",
         "report_copied": "Report copied to clipboard",
         "html_saved": "Standalone HTML saved", "ms": "ms",
-        "m_recovered": "🔧 hop recovered via TCP probe (ICMP was blocked)",
-        "m_target": "🎯 target: no traceroute response (ICMP filtered)",
         "m_pin": "Pin — tooltip becomes draggable by its header",
         "m_unpin": "Unpin and close",
         "m_annot": "➜ direction of travel: from you to the target",
@@ -482,11 +466,9 @@ LANGS = {
         "m_src_learned": "🧠 learned", "m_src_whois": "📜 whois",
         "m_src_near": "📍 nearby",
         "m_src_ixp": "⚡ IXP", "m_role_transit": "🛣️ transit", "m_role_edge": "🏠 edge",
-        "m_src_facility": "🏢 datacenter",
-        "m_src_peeringdb": "🏢 provider HQ",
-        "m_src_rtt": "🧲 nearby by RTT",
         "m_sus": "⚠ geolocation contradicts latency",
         "m_anycast": "🌐 anycast CDN: you're on the nearest edge node, GeoIP doesn't reflect the actual location",
+        "m_recovered": "🔧 hop recovered via TCP probe (ICMP was blocked)",
         "conf_intro": "Confidence: how much independent evidence backs this location.",
         "conf_you": "This is your own node — known, not inferred.",
         "conf_capped": "Lowered: latency contradicts this geolocation.",
@@ -509,7 +491,6 @@ LANGS = {
         "learn_ev_ok": "✓ latency is consistent with the distance to {} (≈{} km)",
         "learn_ev_bad": "⚠ latency {} ms is too small for {} km to {} — likely wrong",
         "hist_empty": "history is empty",
-        "report_skipped": "⊘ {} node(s) skipped (private/timeouts)",
         "about_title": "About",
         "about_coding": "shitty vibe-coding with \n«Qwen3.8-Max»\n «Claude»",
     },
@@ -545,8 +526,8 @@ class GeoPoint:
     country: str
     lat: float
     lon: float
-    ms: float | None = None
-    ms_min: float | None = None
+    ms: Optional[float] = None
+    ms_min: Optional[float] = None
     ms_bound: bool = False   # True if the traceroute reading was an upper bound ("<1 ms"),
                               # not a tight measurement — see rtt_pattern parsing below
     asn: str = ""
@@ -555,12 +536,12 @@ class GeoPoint:
     hcode: str = ""
     wcode: str = ""
     anycast: bool = False
-    ixp: dict | None = None
+    ixp: Optional[dict] = None
     role: str = ""
     geo_agree: bool = False  # True if both independent GeoIP providers agreed
-    recovered: bool = False   # ← добавить: хоп восстановлен TCP-пробой
-    target: bool = False      # ← добавить: синтетический хоп цели
-    hostname: str = ""
+    recovered: bool = False  # True if this hop timed out under the main trace and was
+                              # recovered by a supplementary TCP-SYN probe (see
+                              # trace_worker's post-trace fallback pass, POSIX only)
 
 
 class GeoLearner:
@@ -704,10 +685,6 @@ class GeoLearner:
 
 class BgpInfo:
     """IXP-детект (PeeringDB) и роль AS (RIPEstat). Официальные API, кэш, без блокировок UI."""
-    
-    # PeeringDB WAF блокирует браузерные User-Agent. 
-    # Указываем имя приложения и ваш email (из окна About), чтобы пройти WAF.
-    PDB_HEADERS = {"User-Agent": "GeoTrace/1.0 (geotracemap@protonmail.com)"}
 
     def __init__(self, path):
         self.path = path
@@ -716,45 +693,6 @@ class BgpInfo:
         self.roles = {}
         self.ready = False
         self._load_cache()
-        self.asn_geo = {}  
-        self.fac_db = {}        
-        self.asn_fac_cache = {}
-
-    def fetch_asn_geo(self, asn):
-        asn_clean = strip_as_prefix(asn)
-        if not asn_clean.isdigit():
-            return None
-        if asn_clean in self.asn_geo:            # работает и для отрицательного кэша: неудачи хранятся как None
-            return self.asn_geo[asn_clean]
-        try:
-            net_resp = session.get(f"https://www.peeringdb.com/api/net?asn={asn_clean}",
-                                   timeout=CONFIG["timeout"], headers=self.PDB_HEADERS).json()
-            if not net_resp.get("data"):
-                self.asn_geo[asn_clean] = None   # ASN нет в PeeringDB — повторять бессмысленно
-                return None
-            net = net_resp["data"][0]
-            result = {
-                "name": (net.get("name") or "").lower(),
-                "aka": (net.get("aka") or "").lower(),
-                "hq": None
-            }
-            if net.get("org_id"):
-                org_resp = session.get(f"https://www.peeringdb.com/api/org?id={net['org_id']}",
-                                       timeout=CONFIG["timeout"], headers=self.PDB_HEADERS).json()
-                if org_resp.get("data"):
-                    org = org_resp["data"][0]
-                    if org.get("latitude") and org.get("longitude"):
-                        result["hq"] = {
-                            "city": org.get("city", "Unknown"),
-                            "country": org.get("country", "Unknown"),
-                            "lat": float(org["latitude"]),
-                            "lon": float(org["longitude"])
-                    }
-            self.asn_geo[asn_clean] = result
-            return result
-        except Exception:
-            self.asn_geo[asn_clean] = None
-            return None
 
     def _load_cache(self):
         try:
@@ -762,8 +700,6 @@ class BgpInfo:
                 raw = json.load(f)
             if time.time() - raw.get("ts", 0) < 86400:
                 self._build(raw.get("entries", []))
-                # Загружаем сохранённые дата-центры (если их нет в старом кэше, берём пустой словарь)
-                self.fac_db = raw.get("fac_db", {})
                 self.ready = True
         except Exception:
             pass
@@ -780,27 +716,14 @@ class BgpInfo:
         nets.sort(key=lambda x: x[0].prefixlen, reverse=True)  # longest-prefix match
         self.nets = nets
 
-    def _ensure_fac_db(self):
-        """Подгружает базу дата-центров (/api/fac), если она ещё пуста.
-        В файловый кэш её не пишем сознательно — ответ слишком большой."""
-        if self.fac_db:
-            return
-        try:
-            fac_resp = session.get("https://www.peeringdb.com/api/fac",
-                                   timeout=20, headers=self.PDB_HEADERS).json()
-            self.fac_db = {f["id"]: f for f in fac_resp.get("data", [])}
-        except Exception:
-            pass
-
     def refresh(self):
         """Фоновое обновление базы IXP (раз в сутки). Ошибка = фича выключена."""
         if self.ready:
-            self._ensure_fac_db()   # сети взяты из кэша, но базы ДЦ там нет — подтягиваем
             return
         try:
-            ix = session.get("https://www.peeringdb.com/api/ix", timeout=10, headers=self.PDB_HEADERS).json()["data"]
+            ix = session.get("https://www.peeringdb.com/api/ix", timeout=10).json()["data"]
             meta = {i["id"]: i for i in ix}
-            pfx = session.get("https://www.peeringdb.com/api/ixpfx", timeout=10, headers=self.PDB_HEADERS).json()["data"]
+            pfx = session.get("https://www.peeringdb.com/api/ixpfx", timeout=10).json()["data"]
             entries = []
             for p in pfx:
                 m = meta.get(p["ix_id"])
@@ -812,7 +735,6 @@ class BgpInfo:
                 entries.append({"net": p["prefix"], "name": m.get("name", ""),
                                 "city": m.get("city", ""), "country": m.get("country", ""),
                                 "lat": float(lat), "lon": float(lon)})
-            self._ensure_fac_db()   # заменяет старый инлайн-блок fac_resp = session.get(...api/fac...)
             with self.lock:
                 self._build(entries)
                 self.ready = True
@@ -823,40 +745,6 @@ class BgpInfo:
                 pass
         except Exception:
             pass
-
-    def fetch_facilities(self, asn):
-        """Возвращает список дата-центров, в которых присутствует данный ASN."""
-        asn_clean = strip_as_prefix(asn)
-        if not asn_clean.isdigit():
-            return []
-        if asn_clean in self.asn_fac_cache:
-            return self.asn_fac_cache[asn_clean]
-        if not self.fac_db:
-            return []   # база ДЦ ещё не загрузилась — не кэшируем пустоту, повторим позже
-        try:
-            net_resp = session.get(f"https://www.peeringdb.com/api/net?asn={asn_clean}", timeout=CONFIG["timeout"], headers=self.PDB_HEADERS).json()
-            if not net_resp.get("data"):
-                self.asn_fac_cache[asn_clean] = []
-                return []
-            net_id = net_resp["data"][0]["id"]
-            netfac_resp = session.get(f"https://www.peeringdb.com/api/netfac?net_id={net_id}", timeout=CONFIG["timeout"], headers=self.PDB_HEADERS).json()
-            fac_ids = [f["fac_id"] for f in netfac_resp.get("data", [])]
-            facilities = []
-            for fid in fac_ids:
-                fac = self.fac_db.get(fid)
-                if fac and fac.get("latitude") and fac.get("longitude"):
-                    facilities.append({
-                        "name": fac.get("name", ""),
-                        "city": fac.get("city", "Unknown"),
-                        "country": fac.get("country", "Unknown"),
-                        "lat": float(fac["latitude"]),
-                        "lon": float(fac["longitude"])
-                    })
-            self.asn_fac_cache[asn_clean] = facilities
-            return facilities
-        except Exception:
-            self.asn_fac_cache[asn_clean] = []
-            return []
 
     def lookup_ip(self, ip):
         if not self.ready:
@@ -874,7 +762,7 @@ class BgpInfo:
         return None
 
     def fetch_role(self, asn):
-        asn_clean = strip_as_prefix(asn)
+        asn_clean = str(asn or "").upper().lstrip("AS")
         if not asn_clean.isdigit() or asn_clean in self.roles:
             return
         try:
@@ -888,7 +776,7 @@ class BgpInfo:
             self.roles[asn_clean] = ""
 
     def role_of(self, asn):
-        return self.roles.get(strip_as_prefix(asn), "")
+        return self.roles.get(str(asn or "").upper().lstrip("AS"), "")
 
 
 def clean_target(url_input: str) -> str:
@@ -902,7 +790,7 @@ def clean_target(url_input: str) -> str:
         return "google.com"
 
 
-def get_public_ip() -> str | None:
+def get_public_ip() -> Optional[str]:
     services = [
         ("https://api.ipify.org?format=json", lambda r: r.json().get("ip")),
         ("https://ifconfig.me/ip", lambda r: r.text.strip())]
@@ -943,9 +831,6 @@ def _geo_ipapi(ip):
 geo_cache = {}
 ptr_cache = {}
 whois_cache = {}
-cache_lock = threading.Lock()   # guards the check-then-act pattern on the caches above,
-                                  # which are hit concurrently from several worker pools
-_GEO_FAILED = object()          # sentinel: "already tried, both providers failed"
 
 
 def _geo_dual(ip):
@@ -971,19 +856,13 @@ def _geo_dual(ip):
 
 
 def get_ip_geo(ip):
-    with cache_lock:
-        cached = geo_cache.get(ip, "missing")
-    if cached == "missing":
+    cached = geo_cache.get(ip)
+    if cached is None:
         data, agree = _geo_dual(ip)
         if data is None:
-            with cache_lock:
-                geo_cache[ip] = _GEO_FAILED   # remember the failure — don't hit both
-            return None                        # providers again for every re-reference
+            return None
         cached = dict(data, agree=agree)
-        with cache_lock:
-            geo_cache[ip] = cached
-    elif cached is _GEO_FAILED:
-        return None
+        geo_cache[ip] = cached
     return GeoPoint(hop=0, ip=ip, city=cached["city"], country=cached["country"],
                     lat=cached["lat"], lon=cached["lon"], asn=cached["asn"], org=cached["org"],
                     geo_agree=cached.get("agree", False))
@@ -997,21 +876,24 @@ class PingManager:
 
     @staticmethod
     def _hidden_kwargs():
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        return {"startupinfo": si,
-                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+        kwargs = {}
+        if sys.platform == 'win32':
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            kwargs["startupinfo"] = si
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        return kwargs
 
     def start(self, ip):
         with self.lock:
             old = self.pings.get(ip)
             if old and old["running"]:
                 return
-        cmd = ["ping", "-t", ip]
+        cmd = ["ping", "-t", ip] if sys.platform == 'win32' else ["ping", ip]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding='cp866',
+                                    text=True, encoding='cp866' if sys.platform == 'win32' else 'utf-8',
                                     errors='ignore', **self._hidden_kwargs())
         except Exception:
             return
@@ -1041,7 +923,6 @@ class PingManager:
             e["running"] = False
             try:
                 e["proc"].kill()
-                e["proc"].wait(timeout=2)
             except Exception:
                 pass
 
@@ -1057,7 +938,7 @@ class PingManager:
             lines = list(e["lines"])
         rtts, lost = [], 0
         for ln in lines:
-            m = re.search(r'(?:time|время)\s*[<=]\s*(\d+(?:[.,]\d+)?)', ln, re.IGNORECASE)
+            m = re.search(r'(?:time|время)\s*[<=]\s*(\d+(?:[.,]\d+)?)', ln, re.I)
             if m:
                 rtts.append(float(m.group(1).replace(",", ".")))
             elif any(x in ln.lower() for x in ("timed out", "превышен", "unreachable", "недоступен")):
@@ -1097,7 +978,7 @@ class PingManager:
                 lines = list(e["lines"])
             best = None
             for ln in lines:
-                m = re.search(r'(?:time|время)\s*[<=]\s*(\d+(?:[.,]\d+)?)', ln, re.IGNORECASE)
+                m = re.search(r'(?:time|время)\s*[<=]\s*(\d+(?:[.,]\d+)?)', ln, re.I)
                 if m:
                     v = float(m.group(1).replace(",", "."))
                     if best is None or v < best:
@@ -1176,30 +1057,60 @@ def _start_api_server(manager, token):
 def trace_worker(target, callback, stop_event, app):
     L = LANGS[app.lang]
     callback("log", L["log_geo"])
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
+
+    is_windows = sys.platform == 'win32'
+    startupinfo = None
+    if is_windows:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
 
     def _spawn(cmd):
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding='cp866',
+                                text=True, encoding='cp866' if is_windows else 'utf-8',
                                 startupinfo=startupinfo, errors='ignore')
 
-    cmd = ["tracert", "-d", "-h", "30", target]
+    if is_windows:
+        cmd = ["tracert", "-d", "-h", "30", target]
+    else:
+        # -I (ICMP echo mode) keeps every probe's identifying header field constant across
+        # all TTLs, instead of the default UDP mode's destination port changing on every
+        # probe. Many routers hash ECMP/load-balanced next-hop selection on exactly that
+        # field, so the default mode can silently splice together hops from several
+        # different real paths into what looks like one continuous route. This isn't a
+        # full Paris-traceroute (which pins even more of the 5-tuple and explicitly
+        # verifies per-flow path consistency), but it's a meaningful improvement for zero
+        # extra dependencies, using the stock traceroute binary. -I needs the same
+        # raw-socket privilege the default mode already needs to *receive* ICMP replies, so
+        # this is low-risk — but if it's genuinely unavailable, we fall back below rather
+        # than leaving the user with a broken trace.
+        cmd = ["traceroute", "-n", "-m", "30", "-I", target]
     try:
         process = _spawn(cmd)
-        # Marshal onto the UI thread like every other cross-thread update in this
-        # module — app.process must never be written directly from a worker thread.
-        callback("process", process)
+        app.process = process
     except Exception as e:
         callback("error", L["util_fail"].format(e))
         return
-    try:
-        target_ip = socket.gethostbyname(target)
-    except Exception:
-        target_ip = None
-    seen_target = False
 
+    if not is_windows and "-I" in cmd:
+        time.sleep(0.3)
+        if process.poll() is not None:
+            early = ""
+            try:
+                early = process.stdout.read(2000) or ""
+            except Exception:
+                pass
+            if not re.search(r'^\s*\d+\s', early, re.M):
+                # ICMP mode failed before producing a single real hop line (typically a
+                # permission error for raw ICMP sockets) — fall back to default UDP mode
+                # rather than leaving the user with nothing
+                cmd = ["traceroute", "-n", "-m", "30", target]
+                try:
+                    process = _spawn(cmd)
+                    app.process = process
+                except Exception as e:
+                    callback("error", L["util_fail"].format(e))
+                    return
 
     # собственный IP определяем, пока процесс уже «греется»
     if my_ip := get_public_ip():
@@ -1211,14 +1122,11 @@ def trace_worker(target, callback, stop_event, app):
         callback("log", L["log_noip"])
 
     ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
-    rtt_pattern = re.compile(r'(<)?\s*(\d+(?:[.,]\d+)?)\s*(?:ms|мс)', re.IGNORECASE)
+    rtt_pattern = re.compile(r'(<)?\s*(\d+(?:[.,]\d+)?)\s*(?:ms|мс)', re.I)
     executor = ThreadPoolExecutor(max_workers=4)
     ptr_executor = ThreadPoolExecutor(max_workers=6)
     whois_executor = ThreadPoolExecutor(max_workers=3)
     bgp_executor = ThreadPoolExecutor(max_workers=2)
-    # Hand references to the UI thread so _on_close can shut them down (with
-    # cancel_futures) instead of leaving pending network calls to block process exit.
-    callback("executors", (executor, ptr_executor, whois_executor, bgp_executor))
 
     def submit_bgp(ip, asn):
         try:
@@ -1248,8 +1156,6 @@ def trace_worker(target, callback, stop_event, app):
             role = app.bgp.role_of(asn)
             if role:
                 out["role"] = role
-                app.bgp.fetch_asn_geo(asn)
-                app.bgp.fetch_facilities(asn)
         return out
 
     def submit_geo(ip, hop, ms, ms_min, ms_bound=False, recovered=False):
@@ -1277,13 +1183,8 @@ def trace_worker(target, callback, stop_event, app):
         fut.add_done_callback(on_done)
 
     def submit_whois(ip):
-        with cache_lock:
-            if ip in whois_cache:
-                res = whois_cache[ip]
-            else:
-                whois_cache[ip] = None   # placeholder claims this IP so a concurrent
-                res = "pending"           # hop for the same IP won't also submit it
-        if res != "pending":
+        if ip in whois_cache:
+            res = whois_cache[ip]
             if res:
                 callback("whois", {"ip": ip, "code": res[0]})
             return
@@ -1299,21 +1200,14 @@ def trace_worker(target, callback, stop_event, app):
                 res = f.result()
             except Exception:
                 res = None
-            with cache_lock:
-                whois_cache[ip] = res
+            whois_cache[ip] = res
             if res:
                 callback("whois", {"ip": ip, "code": res[0]})
         fut.add_done_callback(on_done)
 
     def submit_ptr(ip):
-        with cache_lock:
-            if ip in ptr_cache:
-                res = ptr_cache[ip]
-            else:
-                ptr_cache[ip] = None
-                res = "pending"
-        if res != "pending":
-            _ptr_done(ip, res)
+        if ip in ptr_cache:
+            _ptr_done(ip, ptr_cache[ip])
             return
         try:
             fut = ptr_executor.submit(ptr_city_code, ip)
@@ -1327,8 +1221,7 @@ def trace_worker(target, callback, stop_event, app):
                 res = f.result()
             except Exception:
                 res = None
-            with cache_lock:
-                ptr_cache[ip] = res
+            ptr_cache[ip] = res
             _ptr_done(ip, res)
         fut.add_done_callback(on_done)
 
@@ -1343,6 +1236,10 @@ def trace_worker(target, callback, stop_event, app):
     hop_index = 1
     total_lines = 0       # всего строк с hop'ами (глобальные + приватные + таймауты)
     timeout_lines = 0     # сколько из них — таймауты
+    ttl_pattern = re.compile(r'^\s*(\d+)')
+    ttl_hop_map = {}   # raw TTL -> assigned hop_index, for resolved global hops only —
+                        # used below to place TCP-recovered hops at the right position
+    gap_ttls = []       # raw TTLs that came back as a pure timeout (no IP at all)
     try:
         for line in iter(process.stdout.readline, ""):
             if stop_event.is_set():
@@ -1352,7 +1249,7 @@ def trace_worker(target, callback, stop_event, app):
                 continue
             callback("log", cleaned)
             if any(x in cleaned.lower() for x in ("трассировка маршрута", "трассировка завершена",
-                                                   "tracing route", "trace complete", "over")):
+                                                  "tracing route", "trace complete", "over")):
                 continue
             # считаем «пропуски» (приватные + таймауты)
             has_timeout = any(x in cleaned for x in ("*", "Превышен", "timed out"))
@@ -1364,14 +1261,15 @@ def trace_worker(target, callback, stop_event, app):
                     is_global = ipaddress.ip_address(ip).is_global
                 except ValueError:
                     pass
-                # 🎯 трассировка дошла до самой цели — синтетический хоп не понадобится
-                if target_ip and ip == target_ip:
-                    seen_target = True
+            ttl_m = ttl_pattern.match(cleaned)
+            raw_ttl = int(ttl_m.group(1)) if ttl_m else None
             # hop-строка — если есть IP или таймаут
             if ips or has_timeout:
                 total_lines += 1
                 if has_timeout and not is_global:
                     timeout_lines += 1
+                    if not ips and raw_ttl is not None:
+                        gap_ttls.append(raw_ttl)
             if ips:
                 if not is_global:
                     continue
@@ -1380,12 +1278,14 @@ def trace_worker(target, callback, stop_event, app):
                 for m in rtt_pattern.finditer(cleaned):
                     v = float(m.group(2).replace(",", "."))
                     if m.group(1):
-                        any_bound = True
+                        any_bound = True  # "<Xms" — an upper bound, not a tight measurement
                     rtts.append(v)
                 avg_ms = round(sum(rtts) / len(rtts), 1) if rtts else None
                 min_ms = round(min(rtts), 1) if rtts else None
                 submit_geo(ip, hop_index, avg_ms, min_ms, any_bound)
                 submit_ptr(ip)
+                if raw_ttl is not None:
+                    ttl_hop_map[raw_ttl] = hop_index
                 hop_index += 1
     except Exception:
         pass
@@ -1397,30 +1297,72 @@ def trace_worker(target, callback, stop_event, app):
         except subprocess.TimeoutExpired:
             process.kill()
 
+    # TCP-SYN fallback for hops that timed out under the main trace, POSIX only: some
+    # firewalls drop ICMP entirely at the edge while still forwarding TCP through — a
+    # router that never replies to an ICMP-based probe (echo or time-exceeded) often
+    # replies normally to a TCP-based one at the same TTL, since the time-exceeded reply
+    # a transit router generates is independent of the expiring packet's payload
+    # protocol. Only attempted for gaps strictly between two already-resolved hops
+    # (recovering past the destination, or before the first real hop, isn't meaningful),
+    # and gracefully recovers nothing if this traceroute build doesn't support -T (e.g.
+    # some BSD/macOS builds use different flags for TCP mode) or lacks the privilege to
+    # run it — never turns a working trace into a broken one.
+    if not is_windows and not stop_event.is_set() and gap_ttls:
+        real_ttls = sorted(ttl_hop_map)
+        recover_executor = ThreadPoolExecutor(max_workers=3)
+
+        def _tcp_probe_hop(ttl):
+            cmd = ["traceroute", "-n", "-T", "-p", "443", "-f", str(ttl), "-m", str(ttl), target]
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=6, errors="ignore")
+            except Exception:
+                return None
+            for ln in (out.stdout or "").splitlines():
+                found = ip_pattern.findall(ln)
+                if not found:
+                    continue
+                cand = found[-1].strip()
+                try:
+                    if not ipaddress.ip_address(cand).is_global:
+                        continue
+                except ValueError:
+                    continue
+                rtts = [float(m.group(2).replace(",", ".")) for m in rtt_pattern.finditer(ln)]
+                return (cand, round(sum(rtts) / len(rtts), 1) if rtts else None,
+                        round(min(rtts), 1) if rtts else None)
+            return None
+
+        for gap_ttl in gap_ttls:
+            lower = max((t for t in real_ttls if t < gap_ttl), default=None)
+            upper = min((t for t in real_ttls if t > gap_ttl), default=None)
+            if lower is None or upper is None:
+                continue
+            try:
+                fut = recover_executor.submit(_tcp_probe_hop, gap_ttl)
+            except RuntimeError:
+                continue
+
+            def on_recovered(f, ttl=gap_ttl, lower=lower, upper=upper):
+                if stop_event.is_set():
+                    return
+                try:
+                    res = f.result()
+                except Exception:
+                    res = None
+                if not res:
+                    return
+                ip, avg_ms, min_ms = res
+                frac_hop = (ttl_hop_map[lower] +
+                           (ttl_hop_map[upper] - ttl_hop_map[lower]) * (ttl - lower) / (upper - lower))
+                submit_geo(ip, frac_hop, avg_ms, min_ms, False, True)
+                submit_ptr(ip)
+            fut.add_done_callback(on_recovered)
+        recover_executor.shutdown(wait=True)
 
     executor.shutdown(wait=True)
     ptr_executor.shutdown(wait=False)
     whois_executor.shutdown(wait=False)
     bgp_executor.shutdown(wait=False)
-    # 🎯 Синтетический target-хоп: ICMP отфильтрован, tracert не дошёл до цели,
-    # но её IP известен — показываем на карте как конец маршрута
-    if target_ip and not seen_target and not stop_event.is_set():
-        g = get_ip_geo(target_ip)
-        if g:
-            g.hop = hop_index
-            g.target = True
-            g.anycast = is_anycast(g.asn, g.org)
-            pres = ptr_cache.get(target_ip) or ptr_city_code(target_ip)
-            if pres:
-                g.hcode = pres[0]
-                ptr_cache[target_ip] = pres
-            ixp = app.bgp.lookup_ip(target_ip)
-            if ixp:
-                g.ixp = ixp
-            role = app.bgp.role_of(g.asn)
-            if role:
-                g.role = role
-            callback("hop", g)
     callback("aborted" if stop_event.is_set() else "done",
              {"target": target, "global": hop_index - 1,
               "total": total_lines, "timeout": timeout_lines})
@@ -1431,23 +1373,19 @@ class GeoTraceApp(tk.Tk):
         self.title("GeoTrace MAP")
         self.geometry("560x646")
 
-        self.hops: list[GeoPoint] = []
+        self.hops: List[GeoPoint] = []
         self._live_rtt = {}   # ip -> min RTT (ms) from an active continuous-ping session,
                                 # refreshed each _audit_sus() pass — see PingManager.live_min_rtts
-        self._eff_conf = {}   # (hop, ip) -> consensus confidence (0-1) from the last _eff() call,
+        self._eff_conf = {}   # ip -> consensus confidence (0-1) from the last _eff() call,
                                 # populated as a side effect so callers can display it
         self.map_opened = False
-        self.process: subprocess.Popen | None = None
+        self.process: Optional[subprocess.Popen] = None
         self.stop_event = threading.Event()
         self.ping_summary = ""
         self.map_rev = 0
         self.data_rev = 0
         self.trace_stats = None
         self.hist_win = None
-        self._hist_h = 0
-        self._bg_executors = []   # ThreadPoolExecutors handed over by the current
-                                    # trace_worker run, so _on_close can shut them down
-        self.api_server = None
 
         prefs = load_settings()
         self.theme = prefs.get("theme", "light")
@@ -1477,7 +1415,7 @@ class GeoTraceApp(tk.Tk):
         self.api_port = 0
         self.api_token = secrets.token_urlsafe(24)
         try:
-            self.api_port, self.api_server = _start_api_server(self.ping_manager, self.api_token)
+            self.api_port, _ = _start_api_server(self.ping_manager, self.api_token)
         except Exception:
             pass
 
@@ -1589,6 +1527,12 @@ class GeoTraceApp(tk.Tk):
             e = CITY_DB[code]
             return (e[0] if ru else e[1]), (e[4] if ru else e[5]), e[2], e[3]
 
+        # Weighted-consensus city resolution: gather every signal that has an opinion about
+        # this hop's location, weight each by how much that kind of signal is generally
+        # trusted (SRC_WEIGHT), then group signals that agree on (roughly) the same place
+        # and sum their weight. This lets two independently weaker signals that agree with
+        # each other occasionally outrank a single stronger signal that disagrees with
+        # everything else, instead of a strict first-match priority chain.
         candidates = []  # (weight, group_key, city, country, lat, lon, src)
 
         if h.hcode and h.hcode in CITY_DB:
@@ -1602,7 +1546,7 @@ class GeoTraceApp(tk.Tk):
 
         if h.ixp:
             candidates.append((SRC_WEIGHT["ixp"], ("ixp", h.ixp.get("name")),
-                               h.ixp["city"], h.ixp["country"], h.ixp["lat"], h.ixp["lon"], "ixp"))
+                                h.ixp["city"], h.ixp["country"], h.ixp["lat"], h.ixp["lon"], "ixp"))
 
         if h.wcode and h.wcode in CITY_DB:
             c, ct, la, lo = city_of(h.wcode)
@@ -1612,86 +1556,15 @@ class GeoTraceApp(tk.Tk):
         if hr is not None:
             prev = next((o for o in self.hops if o.hop == h.hop - 1), None)
             pr = self._rtt(prev) if prev is not None else None
-            if prev is not None and pr is not None:
+            if prev is not None and pr is not None and abs(hr - pr) <= 2:
                 pc, pct, pla, plo, psrc = self._eff(prev)
-                delta = abs(hr - pr)
-                # старое правило: наследуем только от "уверенных" узлов при почти равном RTT
-                if delta <= 2 and (psrc in ("host", "learned", "whois", "near") or prev.hop == 0):
+                if psrc in ("host", "learned", "whois", "near") or prev.hop == 0:
                     candidates.append((SRC_WEIGHT["near"], ("pt", round(pla, 2), round(plo, 2)),
-                                       pc, pct, pla, plo, "near"))
-                # RTT-Override: разница <= 4 мс => физически в одном месте,
-                # вес 10.0 перебивает любой GeoIP (даже geo_agree)
-                elif delta <= 4:
-                    candidates.append((SRC_WEIGHT["rtt_override"], ("rtt_override", round(pla, 2), round(plo, 2)),
-                                       pc, pct, pla, plo, "rtt_override"))
+                                        pc, pct, pla, plo, "near"))
 
         c, ct = translate_city(h.city, h.country, self.lang)
         geo_weight = SRC_WEIGHT["geo_agree"] if h.geo_agree else SRC_WEIGHT["geo"]
         candidates.append((geo_weight, ("pt", round(h.lat, 2), round(h.lon, 2)), c, ct, h.lat, h.lon, h.src))
-
-        # PeeringDB: штаб-квартира ASN
-        pdb = self.bgp.fetch_asn_geo(h.asn)
-        if pdb and pdb.get("hq") and not h.anycast:  # Игнорируем CDN/Anycast (AS13335 и т.д.)
-            host_lower = (h.hostname or "").lower()
-            name_match = bool(pdb["name"]) and pdb["name"] in host_lower
-            # AKA в PeeringDB часто перечисляется через запятую
-            aka_match = bool(pdb["aka"]) and any(part.strip() in host_lower for part in pdb["aka"].split(','))
-            # Если провайдер совпадает с hostname ИЛИ у нас вообще нет других зацепок (hcode пуст)
-            if name_match or aka_match or not h.hcode:
-                c, ct, la, lo = pdb["hq"]["city"], pdb["hq"]["country"], pdb["hq"]["lat"], pdb["hq"]["lon"]
-                candidates.append((
-                    SRC_WEIGHT["peeringdb"],
-                    ("pt", round(la, 2), round(lo, 2)),
-                    c, ct, la, lo, "peeringdb"
-                ))
-
-        # <--- Boss Level: Facilities (Точки присутствия / Дата-центры)
-        if h.asn and not h.anycast:
-            facs = self.bgp.fetch_facilities(h.asn)
-            if facs:
-                geo_city_l = (h.city or "").strip().lower()
-                ptr_city_l = ""
-                if h.hcode and h.hcode in CITY_DB:
-                    ptr_city_l = CITY_DB[h.hcode][1].lower()  # Английское название
-
-                best_fac = None
-                for fac in facs:
-                    fac_city_l = (fac["city"] or "").strip().lower()
-                    city_match = False
-                    # Проверка 1: Совпадение названий городов
-                    if fac_city_l and (fac_city_l in geo_city_l or geo_city_l in fac_city_l or
-                                       fac_city_l in ptr_city_l or ptr_city_l in fac_city_l):
-                        city_match = True
-                    # Проверка 2: Дата-центр в пригороде (расстояние < 50 км от GeoIP)
-                    elif h.lat and h.lon:
-                        dist = haversine(h.lat, h.lon, fac["lat"], fac["lon"])
-                        if dist < 50:
-                            city_match = True
-
-                    if city_match:
-                        best_fac = fac
-                        break
-
-                if best_fac:
-                    boosted = False
-                    # Ищем существующего кандидата, чтобы усилить его и снэпнуть к зданию
-                    for i, (w, key, cc, cct, cla, clo, csrc) in enumerate(candidates):
-                        if csrc in ("host", "geo", "geo_agree", "learned", "peeringdb", "whois"):
-                            if (cc.lower() == best_fac["city"].lower() or
-                                    cc.lower() in best_fac["city"].lower() or
-                                    best_fac["city"].lower() in cc.lower() or
-                                    cc.lower() in ("unknown", "")):
-                                # БОСС-СНЭП: усиливаем вес И заменяем координаты на точные координаты ДЦ
-                                candidates[i] = (w + SRC_WEIGHT["facility"], key, cc, cct,
-                                                 best_fac["lat"], best_fac["lon"], csrc)
-                                boosted = True
-                                break
-
-                    # Если бустить некого, добавляем как самостоятельного мощного кандидата
-                    if not boosted:
-                        candidates.append((SRC_WEIGHT["facility"], ("facility", best_fac["name"]),
-                                           best_fac["city"], best_fac["country"],
-                                           best_fac["lat"], best_fac["lon"], "facility"))
 
         groups = {}
         for w, key, cc, cct, cla, clo, csrc in candidates:
@@ -1704,10 +1577,13 @@ class GeoTraceApp(tk.Tk):
                 best_total, best_key = total, key
         runner_up = max((sum(m[0] for m in mem) for key, mem in groups.items() if key != best_key),
                         default=0.0)
+        # Confidence reflects the winning group's margin over its strongest competitor,
+        # normalized against a fixed ceiling (CONFIDENCE_CEILING) rather than against
+        # whatever weight happened to be present. Normalizing against only-what's-present
+        # would let a single weak, uncorroborated signal (e.g. raw GeoIP alone) trivially
+        # "win" 100% of its own tiny pool — no competing evidence isn't strong evidence.
         margin = max(0.0, best_total - runner_up)
-        # keyed by (hop, ip), not just ip — a routing loop can revisit the same IP at
-        # a different hop, and each occurrence should keep its own confidence score
-        self._eff_conf[(h.hop, h.ip)] = round(min(1.0, margin / CONFIDENCE_CEILING), 3)
+        self._eff_conf[h.ip] = round(min(1.0, margin / CONFIDENCE_CEILING), 3)
         top = max(groups[best_key], key=lambda m: m[0])
         return top[1], top[2], top[3], top[4], top[5]
 
@@ -1729,7 +1605,7 @@ class GeoTraceApp(tk.Tk):
         here" is confusing regardless of how the underlying signals happen to score."""
         if h.hop == 0:
             return 1.0
-        c = self._eff_conf.get((h.hop, h.ip), 1.0)
+        c = self._eff_conf.get(h.ip, 1.0)
         if h.ip in sus:
             return min(c, 0.3)
         if h.ip in consistent:
@@ -1946,12 +1822,12 @@ class GeoTraceApp(tk.Tk):
         win = tk.Toplevel(self)
         self.hist_win = win
         win.wm_overrideredirect(True)
+        win.attributes("-topmost", True)
         x = self.entry.winfo_rootx()
         y = self.entry.winfo_rooty() + self.entry.winfo_height() + 2
         w = max(240, self.entry.winfo_width())
         rows = max(1, len(self.history))
-        self._hist_h = 30 + rows * 26
-        win.geometry(f"{w}x{self._hist_h}+{x}+{y}")
+        win.geometry(f"{w}x{30 + rows * 26}+{x}+{y}")
         t = THEMES[self.theme]
         win.config(bg=t["outline"])
         if not self.history:
@@ -1960,35 +1836,14 @@ class GeoTraceApp(tk.Tk):
             for a in self.history:
                 row = tk.Frame(win, bg=t["panel"])
                 row.pack(fill=tk.X, padx=1, pady=1)
-                lb = tk.Label(
-                    row, text=a, anchor="w", bg=t["panel"], fg=t["fg"],
-                    font=("Arial", 9), padx=6, pady=3, cursor="hand2"
-                )
+                lb = tk.Label(row, text=a, anchor="w", bg=t["panel"], fg=t["fg"],
+                              font=("Arial", 9), padx=6, pady=3, cursor="hand2")
                 lb.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 lb.bind("<Button-1>", lambda e, addr=a: self._pick_history(addr))
-                xb = tk.Button(
-                    row, text="✕", width=2, relief="flat", bd=0,
-                    bg=t["panel"], fg=t["fg"],
-                    activebackground=t["danger_hover"],
-                    command=lambda addr=a: self._drop_history(addr)
-                )
+                xb = tk.Button(row, text="✕", width=2, relief="flat", bd=0,
+                               bg=t["panel"], fg=t["fg"], activebackground=t["danger_hover"],
+                               command=lambda addr=a: self._drop_history(addr))
                 xb.pack(side=tk.RIGHT)
-        win.update_idletasks()
-        win.lift()
-        self.bind("<Configure>", self._reposition_history)
-
-    def _reposition_history(self, event=None):
-        """Держит список истории у поля ввода при перемещении/ресайзе окна."""
-        if self.hist_win is None:
-            return
-        # <Configure> пропагирует и от дочерних виджетов — реагируем только
-        # на перемещение/ресайз самого главного окна
-        if event is not None and event.widget is not self:
-            return
-        x = self.entry.winfo_rootx()
-        y = self.entry.winfo_rooty() + self.entry.winfo_height() + 2
-        w = max(240, self.entry.winfo_width())
-        self.hist_win.geometry(f"{w}x{self._hist_h}+{x}+{y}")
 
     def _pick_history(self, addr):
         self.entry.delete(0, tk.END)
@@ -2010,10 +1865,6 @@ class GeoTraceApp(tk.Tk):
             except Exception:
                 pass
             self.hist_win = None
-        try:
-            self.unbind("<Configure>")
-        except Exception:
-            pass
 
     # ------------------------------------------------------------- hover
     def _bind_hover(self, widget):
@@ -2303,11 +2154,7 @@ class GeoTraceApp(tk.Tk):
 
     # ------------------------------------------------------------- trace
     def _toggle_trace(self):
-        # self.tracing is set synchronously (on the UI thread) inside _start()/_stop(),
-        # unlike self.process which is only populated once the background trace_worker
-        # thread actually spawns tracert — checking self.process here left a race window
-        # where a second click before that assignment landed would call _start() again.
-        if self.tracing:
+        if self.process:
             self._stop()
         else:
             self._start()
@@ -2326,8 +2173,6 @@ class GeoTraceApp(tk.Tk):
 
         self.stop_event = threading.Event()
         self.tracing = True
-        self.process = None
-        self._bg_executors = []
         self.ptr_attempts = 0
         self.ptr_matches = 0
         self.hops.clear()
@@ -2372,37 +2217,14 @@ class GeoTraceApp(tk.Tk):
         if action == "log":
             self.log.insert(tk.END, f"{data}\n")
             self.log.see(tk.END)
-
-        elif action == "process":
-            self.process = data
-
-        elif action == "executors":
-            self._bg_executors.extend(data)
-
         elif action == "hop":
             self.hops.append(data)
-        # ── FIX: применить уже пришедшие PTR/WHOIS (гонка колбэков) ──
-        # ptr_cache/whois_cache заполняются в trace_worker *до* отправки "hop",
-        # поэтому в момент прихода хопа кэш может уже содержать данные для этого IP.
-            ip = data.ip
-            if ip in ptr_cache and ptr_cache[ip] and not data.hcode:
-                code, host = ptr_cache[ip]
-                data.hcode = code
-                data.hostname = host
-            # НЕ трогаем data.src: он описывает источник GEO-кандидата (geo/geo_agree),
-            # а PTR-информация живёт отдельно в hcode. Подмена src ломает _eff и тултип.
-            if ip in whois_cache and whois_cache[ip] and not data.wcode:
-                wcode, _ = whois_cache[ip]
-                data.wcode = wcode
-        # ── END FIX ──
             if self.tracing:
                 self.status.config(text=self.tr("tracing_hops", len(self.hops)))
             self._update_map()
-
         elif action == "ptr_stat":
             self.ptr_attempts += 1
             self.ptr_matches += data
-
         elif action == "fix":
             ip = data.get("ip", "")
             code = data.get("code", "")
@@ -2410,40 +2232,30 @@ class GeoTraceApp(tk.Tk):
             if ip and code:
                 hop = None
                 for h in self.hops:
-                    if h.ip == ip and (not h.hcode or h.hcode != code):
+                    if h.ip == ip:
                         h.hcode = code
-                        h.hostname = host
-                    # убрал `h.src = "host"` — см. комментарий выше и §3.4 предыдущего ревью
+                        h.src = "host"
                         hop = h
-                        break
-            # если хоп ещё не добавлен — ничего не делаем: _process("hop") применит
-            # данные из ptr_cache позже; кэш в trace_worker уже заполнен
-                if hop is not None and self.hops:
+                if self.hops:
                     self._update_map(final=self.process is None)
-                # обучение — только для реального хопа, найденного в self.hops
-                    if code in CITY_DB and not hop.anycast:
-                        if self.learn_mode == "auto":
-                            feasible, corroborated, _dist = self._learn_evidence(hop, code)
-                            self.learner.observe(ip, code, host,
-                                                 feasible=feasible, corroborated=corroborated)
-                        elif self.learn_mode == "semi":
-                            if not self.learner.trusted_code(ip):
-                                self._queue_suggestion({
-                                    "ip": ip, "code": code, "host": host,
-                                    "geo_city": hop.city, "ms": hop.ms,
-                                    "asn": hop.asn, "org": hop.org, "hop": hop.hop})
-
+                if hop and code in CITY_DB and not hop.anycast:
+                    if self.learn_mode == "auto":
+                        feasible, corroborated, _dist = self._learn_evidence(hop, code)
+                        self.learner.observe(ip, code, host, feasible=feasible, corroborated=corroborated)
+                    elif self.learn_mode == "semi":
+                        if not self.learner.trusted_code(ip):
+                            self._queue_suggestion({
+                                "ip": ip, "code": code, "host": host,
+                                "geo_city": hop.city, "ms": hop.ms,
+                                "asn": hop.asn, "org": hop.org, "hop": hop.hop})
         elif action == "whois":
             ip = data.get("ip", "")
             code = data.get("code", "")
             if ip and code:
-                changed = False
                 for h in self.hops:
-                    if h.ip == ip and not h.wcode:
+                    if h.ip == ip:
                         h.wcode = code
-                        changed = True
-                        break
-                if changed and self.hops:
+                if self.hops:
                     self._update_map(final=self.process is None)
         elif action == "bgp":
             ip = data.get("ip", "")
@@ -2487,20 +2299,26 @@ class GeoTraceApp(tk.Tk):
 
     # ------------------------------------------------------------- ping
     def _ping_worker(self, target):
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        kwargs = {"startupinfo": si,
-                  "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+        is_windows = sys.platform == 'win32'
+        cmd = (["ping", "-n", "4", "-w", "1500", target] if is_windows
+               else ["ping", "-c", "4", "-W", "2", target])
+        kwargs = {}
+        if is_windows:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            kwargs["startupinfo"] = si
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
         rtts = []
         icmp_ok = False
         try:
-            r = subprocess.run(["ping", "-n", "4", "-w", "1500", target],
-                               capture_output=True, text=True, timeout=20,
-                               encoding='cp866', errors='ignore', **kwargs)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20,
+                               encoding='cp866' if is_windows else 'utf-8',
+                               errors='ignore', **kwargs)
             out = r.stdout or ""
             rtts = [float(v.replace(",", ".")) for v in
-                    re.findall(r'(?:time|время)\s*[<=]\s*(\d+(?:[.,]\d+)?)', out, re.IGNORECASE)]
+                    re.findall(r'(?:time|время)\s*[<=]\s*(\d+(?:[.,]\d+)?)', out, re.I)]
             icmp_ok = len(rtts) > 0
         except Exception:
             pass
@@ -2523,15 +2341,19 @@ class GeoTraceApp(tk.Tk):
         self._callback("ping", summary)
 
     def _tcp_ping(self, target):
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-        kwargs = {"startupinfo": si,
-                  "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+        is_windows = sys.platform == 'win32'
+        cmd = (["curl", "-o", "NUL", "-s", "-w", "%{time_connect}", f"https://{target}/"]
+               if is_windows else
+               ["curl", "-o", "/dev/null", "-s", "-w", "%{time_connect}", f"https://{target}/"])
+        kwargs = {}
+        if is_windows:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            kwargs["startupinfo"] = si
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         try:
-            r = subprocess.run(["curl", "-o", "NUL", "-s", "-w", "%{time_connect}",
-                                f"https://{target}/"],
-                               capture_output=True, text=True, timeout=5, **kwargs)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5, **kwargs)
             if r.returncode == 0 and r.stdout.strip():
                 t = float(r.stdout.strip())
                 return int(round(t * 1000))
@@ -2559,19 +2381,19 @@ class GeoTraceApp(tk.Tk):
             c, ct, _, _, src = self._eff(h)
             ms = f" · {'<' if h.ms_bound else ''}{h.ms:.0f} {unit}" if h.ms is not None else ""
             org = f" · {h.org}" if h.org else ""
-            tgt = " · 🎯" if h.target else ""
             asn = f" ({h.asn})" if h.asn else ""
-            src_sym = {"ixp": "⚡", "facility": "🏢", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍", "rtt_override": "🧲", "peeringdb": "🏢"}.get(src, "🛰")
+            src_sym = {"ixp": "⚡", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍"}.get(src, "🛰")
             ac = " · 🌐" if h.anycast else ""
+            rec = " · 🔧" if h.recovered else ""
             warn = " · ⚠" if h.ip in sus else ""
             role = " · 🛣️" if h.role == "transit" else (" · 🏠" if h.role == "edge" else "")
             conf = self._conf(h, sus, consistent)
             low_conf = f" · {conf:.0%}" if conf < 0.6 else ""
-            lines.append(f"{h.hop} · {c}, {ct} · {h.ip}{ms}{org}{asn}{role} · {src_sym}{low_conf}{tgt}{ac}{warn}")
+            lines.append(f"{h.hop} · {c}, {ct} · {h.ip}{ms}{org}{asn}{role} · {src_sym}{low_conf}{rec}{ac}{warn}")
         if self.trace_stats:
             skip = self.trace_stats["total"] - self.trace_stats["global"]
             if skip > 0:
-                lines.append(self.tr("report_skipped", skip))
+                lines.append(f"⊘ {skip} узел(ов) пропущено (приватные/таймауты)")
         if self.ping_summary:
             lines.append(self.tr("report_ping", self.ping_summary))
         self.clipboard_clear()
@@ -2589,11 +2411,12 @@ class GeoTraceApp(tk.Tk):
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f, delimiter=";")
             w.writerow(["hop", "ip", "city", "country", "lat", "lon", "avg_ms", "ms_bound", "asn", "org",
-                        "geo_src", "confidence", "anycast", "suspect", "target"])
+                        "geo_src", "confidence", "recovered", "anycast", "suspect"])
             for h in self._sorted_hops():
                 c, ct, la, lo, src = self._eff(h)
                 w.writerow([h.hop, h.ip, c, ct, la, lo, h.ms if h.ms is not None else "",
-                            1 if h.ms_bound else 0, h.asn, h.org, src, self._conf(h, sus, consistent), 1 if h.anycast else 0, 1 if h.ip in sus else 0, 1 if h.target else 0])
+                            1 if h.ms_bound else 0, h.asn, h.org, src, self._conf(h, sus, consistent),
+                            1 if h.recovered else 0, 1 if h.anycast else 0, 1 if h.ip in sus else 0])
 
     def _save_json(self):
         if not self.hops:
@@ -2646,12 +2469,8 @@ class GeoTraceApp(tk.Tk):
             "src_geo": L["m_src_geo"], "src_host": L["m_src_host"],
             "src_learned": L["m_src_learned"], "src_whois": L["m_src_whois"],
             "src_near": L["m_src_near"], "src_ixp": L["m_src_ixp"],
-            "src_facility": L["m_src_facility"],
-            "src_peeringdb": L["m_src_peeringdb"],
-            "src_rtt": L["m_src_rtt"],
             "role_transit": L["m_role_transit"], "role_edge": L["m_role_edge"],
-            "sus": L["m_sus"], "anycast": L["m_anycast"],
-            "target": L["m_target"], "recovered": L["m_recovered"],
+            "sus": L["m_sus"], "anycast": L["m_anycast"], "recovered": L["m_recovered"],
             "pin": L["m_pin"], "unpin": L["m_unpin"],
         }
         html = """<!DOCTYPE html>
@@ -2672,7 +2491,6 @@ class GeoTraceApp(tk.Tk):
         .tt-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 4px 6px 8px 6px; border-bottom: 1px solid rgba(255,255,255,.08); margin-bottom: 6px; position: sticky; top: -8px; background: rgba(17, 24, 39, .97); margin-top: -8px; padding-top: 8px; border-radius: 12px 12px 0 0; z-index: 2; }
         .pinned-tip { position: fixed; min-width: 250px; max-width: 340px; max-height: calc(100vh - 24px); overflow-y: auto; overflow-x: hidden; background: rgba(17, 24, 39, .96); backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,.08); border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.4); padding: 8px; font-family: "Segoe UI", system-ui, Arial, sans-serif; color: #f9fafb; }
         .pinned-tip .tt-header { cursor: move; user-select: none; }
-        .tt-target { margin: 2px 0 0 30px; font-size: 10.5px; color: #ef5350; }
         .tt-city { font-weight: 600; font-size: 13px; }
         .tt-count { font-size: 11px; color: #9ca3af; background: rgba(255,255,255,.08); padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
         .tt-pin { margin-left: auto; background: rgba(255,255,255,.08); border: none; color: #e5e7eb; width: 24px; height: 24px; border-radius: 6px; cursor: pointer; font-size: 12px; line-height: 1; flex: 0 0 auto; filter: grayscale(70%); opacity: .75; }
@@ -2690,6 +2508,7 @@ class GeoTraceApp(tk.Tk):
         .tt-org { margin: 2px 0 0 30px; font-size: 11px; color: #8b93a7; white-space: normal; overflow-wrap: break-word; }
         .tt-sus { margin: 2px 0 0 30px; font-size: 10.5px; color: #fbbf24; }
         .tt-anycast { margin: 2px 0 0 30px; font-size: 10.5px; color: #a78bfa; }
+        .tt-recovered { margin: 2px 0 0 30px; font-size: 10.5px; color: #4dd0e1; }
         .tt-conf { font-family: Consolas, monospace; font-size: 10px; opacity: .85; cursor: help; }
         .tt-seam { display: flex; align-items: center; gap: 6px; margin: 4px 2px; font-size: 10.5px; color: #fbbf24; }
         .tt-seam::before, .tt-seam::after { content: ""; flex: 1; border-top: 1px dashed rgba(251,191,36,.4); }
@@ -2801,18 +2620,12 @@ class GeoTraceApp(tk.Tk):
         function fmtMs(ms, bound) { return (bound ? '<' : '') + Math.round(ms) + ' ' + LSTR.ms; }
         function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
         function srcLabel(it) {
-            var map = {
-                'host': LSTR.src_host,
-                'learned': LSTR.src_learned,
-                'whois': LSTR.src_whois,
-                'near': LSTR.src_near,
-                'ixp': LSTR.src_ixp,
-                'facility': LSTR.src_facility,
-                'peeringdb': LSTR.src_peeringdb,
-                'rtt_override': LSTR.src_rtt
-    };
-            return map[it.src] || LSTR.src_geo;
-}
+            return it.src === 'host' ? LSTR.src_host :
+                   (it.src === 'learned' ? LSTR.src_learned :
+                   (it.src === 'whois' ? LSTR.src_whois :
+                   (it.src === 'near' ? LSTR.src_near :
+                   (it.src === 'ixp' ? LSTR.src_ixp : LSTR.src_geo))));
+        }
         function confBadge(it) {
             // consensus confidence from GeoTraceApp._eff()'s weighted-vote city resolution —
             // how much of the total signal weight (PTR/whois/IXP/GeoIP/near-inherit) backs
@@ -2835,12 +2648,12 @@ class GeoTraceApp(tk.Tk):
             m.items.forEach(function (it, i) {
                 var prev = i > 0 ? m.items[i - 1] : null;
                 if (prev && it.asn && prev.asn && it.asn !== prev.asn) html += '<div class="tt-seam">' + LSTR.seam + '</div>';
-                var badge = it.user ? '#2e7d32' : (it.target ? '#d32f2f' : (it.sus ? '#78909c' : (it.anycast ? '#a78bfa' : latColor(it.ms))));
+                var badge = it.user ? '#2e7d32' : (it.sus ? '#78909c' : (it.anycast ? '#a78bfa' : latColor(it.ms)));
                 html += '<div class="tt-row tt-ping' + (i % 2 ? ' tt-alt' : '') +
                         '" data-ip="' + esc(it.ip) + '" data-city="' + esc(it.city) +
                         '" title="' + LSTR.footer + '"><div class="tt-main">' +
                         '<div class="tt-line1">' +
-                        '<span class="tt-hop" style="background:' + badge + '">' + (it.target ? '🎯' : it.hop) + '</span>' +
+                        '<span class="tt-hop" style="background:' + badge + '">' + it.hop + '</span>' +
                         '<span class="tt-ip">' + esc(it.ip) + '</span>' +
                         (it.ms != null ? '<span class="tt-ms">' + fmtMs(it.ms, it.ms_bound) + '</span>' : '') +
                         '</div>' +
@@ -2852,8 +2665,8 @@ class GeoTraceApp(tk.Tk):
                          (it.role === 'edge' ? ' · ' + LSTR.role_edge : '')) + '</div>' +
                         (it.anycast ? '<div class="tt-anycast">' + LSTR.anycast + '</div>' :
                          (it.sus ? '<div class="tt-sus">' + LSTR.sus + '</div>' : '')) +
-                        (it.target ? '<div class="tt-target">' + LSTR.target + '</div>' : '') +
-                     '</div></div>';
+                        (it.recovered ? '<div class="tt-recovered">' + LSTR.recovered + '</div>' : '') +
+                        '</div></div>';
             });
             if (API_PORT) html += '<div class="tt-footer">' + LSTR.footer + '</div>';
             return html;
@@ -3410,14 +3223,15 @@ document.addEventListener('click', function (e) {
                 applyTheme(d.theme || 'light');
                 var traces = [];
                 if (d.line_lon.length > 1) {
-                    traces.push({type: 'scattergeo', mode: 'lines', lon: d.line_lon, lat: d.line_lat, line: {width: 4, color: 'rgba(255,10,10,0.35)'}, hoverinfo: 'skip'});
+                    traces.push({type: 'scattergeo', mode: 'lines', lon: d.line_lon, lat: d.line_lat, line: {width: 2, color: 'rgba(211,47,47,0.35)'}, hoverinfo: 'skip'});
+                    traces.push({type: 'scattergeo', mode: 'lines', lon: d.line_lon, lat: d.line_lat, line: {width: 4, color: '#d32f2f'}, hoverinfo: 'skip'});
                 }
                 if (d.markers.length > 0) {
                     traces.push({
                         type: 'scattergeo', mode: 'markers+text',
                         lon: d.markers.map(function(m){return m.lon;}),
                         lat: d.markers.map(function(m){return m.lat;}),
-                        text: d.markers.map(function(m){return m.tgt ? '🎯' : m.hop;}),
+                        text: d.markers.map(function(m){return m.hop;}),
                         textposition: d.markers.map(function(m){return m.tp || 'top center';}),
                         textfont: {color: labelColor, size: 10},
                         marker: { size: d.markers.map(function(m){return m.size;}), color: d.markers.map(function(m){return m.color;}), line: {width: 1.5, color: 'white'} },
@@ -3532,13 +3346,13 @@ document.addEventListener('click', function (e) {
                     line += f" · {'<' if h.ms_bound else ''}{h.ms:.0f} {unit}"
                 if h.org:
                     line += f" · {h.org} ({h.asn})"
-                src_sym = {"ixp": "⚡", "facility": "🏢", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍", "rtt_override": "🧲", "peeringdb": "🏢"}.get(src, "🛰")
-                if h.target:
-                    line += " · 🎯"
-                    line += f" · {src_sym}"
+                src_sym = {"ixp": "⚡", "host": "📇", "learned": "🧠", "whois": "📜", "near": "📍"}.get(src, "🛰")
+                line += f" · {src_sym}"
                 conf = self._conf(h, sus, consistent)
                 if conf < 0.6:
                     line += f" · {conf:.0%}"
+                if h.recovered:
+                    line += " · 🔧"
                 if h.anycast:
                     line += " · 🌐"
                 if h.ip in sus:
@@ -3547,22 +3361,18 @@ document.addEventListener('click', function (e) {
 
             markers.append({
                 "lon": cl["lon"], "lat": cl["lat"],
-                "tgt": all(h.target for h in hops),
-                "color": (
-                         "#78909c" if any(h.ip in sus for h in hops) else
-                         "#a78bfa" if all(h.anycast for h in hops) else
-                         "#d32f2f" if all(h.target for h in hops) else
-                         "#2e7d32" if is_user else "#0288d1"
-    ),
                 "hop": ",".join(str(h.hop) for h in hops),
                 "tp": cl["tp"],
+                "color": "#78909c" if any(h.ip in sus for h in hops)
+                         else "#a78bfa" if all(h.anycast for h in hops)
+                         else ("#2e7d32" if is_user else "#0288d1"),
                 "size": (14 if is_user else 12) + min(count - 1, 4) * 2,
                 "items": [
                     {"hop": h.hop, "ip": h.ip, "city": eff[h.ip][0], "country": eff[h.ip][1],
                      "user": h.hop == 0, "ms": h.ms, "ms_bound": h.ms_bound, "asn": h.asn, "org": h.org,
                      "src": eff[h.ip][4], "conf": self._conf(h, sus, consistent),
                      "conf_note": self._conf_note(h, sus, consistent, eff[h.ip][4]), "role": h.role,
-                     "sus": h.ip in sus, "anycast": h.anycast, "recovered": h.recovered, "target": h.target}
+                     "sus": h.ip in sus, "anycast": h.anycast, "recovered": h.recovered}
                     for h in hops
                 ],
                 "copy": "\n────────────\n".join(copy_lines),
@@ -3584,7 +3394,13 @@ document.addEventListener('click', function (e) {
             with open(CONFIG["map_file"], "w", encoding="utf-8") as f:
                 f.write(self._render_map_html(self.entry.get().strip()))
             self.map_opened = True
-            os.startfile(CONFIG["map_file"])
+            if sys.platform == 'win32':
+                os.startfile(CONFIG["map_file"])
+            else:
+                try:
+                    subprocess.Popen(["xdg-open", CONFIG["map_file"]])
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------- misc
     def _copy_log(self) -> None:
@@ -3612,17 +3428,6 @@ document.addEventListener('click', function (e) {
             except Exception:
                 pass
         self.ping_manager.stop_all()
-        for ex in self._bg_executors:
-            try:
-                ex.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        if self.api_server is not None:
-            try:
-                self.api_server.shutdown()
-                self.api_server.server_close()
-            except Exception:
-                pass
         self.destroy()
 
 

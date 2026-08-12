@@ -1,1 +1,44 @@
-Nothing needs to be added to .gitignore since only a markdown file (README_EN.md) was added, which is a source/config file and should not be ignored.
+```python
+# Compiled Python files
+*.pyc
+__pycache__/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# Python cache
+.mypy_cache/
+.pytest_cache/
+
+# Build directories
+dist/
+build/
+target/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+```
