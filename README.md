@@ -1,5 +1,6 @@
 # GeoTrace MAP
-🇺🇸[English](doc/README_EN.md)
+> [!TIP]
+> [Description in English](doc/README_EN.md)
 
 Настольный инструмент визуализации сетевых маршрутов на карте мира с
 многоисточниковой геолокацией узлов.
