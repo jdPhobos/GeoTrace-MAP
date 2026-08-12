@@ -9,7 +9,7 @@ Desktop tool for visualizing network routes on a world map with multi-source nod
 ## Features
 
 - **Traceroute** (`tracert`/`traceroute`) with hop parsing, RTT (average and minimum), and private address filtering.
-- **Multi-source geolocation** with evidence priority: `📇 hostname (PTR)` → `🧠 trained` → `⚡IXP (PeeringDB)` → `📜 RIPEstat` → `📍 route neighbor` → `🛰 GeoIP`.
+- **Multi-source geolocation with weighted voting**: independent sources pointing to the same location have their weights combined, so several weak signals that agree can outweigh a single strong but isolated signal. Sources and weights: ⚡ IXP/PeeringDB (5.0) · 📇 hostname PTR (4.0) · 🧠 trained database (3.2) · 🛰 two matching GeoIPs (2.4) · 📜 RIPEstat WHOIS (2.0) · 📍 route neighbor with nearly equal RTTs (1.6) · single GeoIP (1.0). GeoIP queries two independent providers (ipwho.is and ip-api.com); a match between them increases the weight. For each node, a confidence percentage is displayed along with a text hint.
 - **Anycast/CDN detection** (Cloudflare, Akamai, Fastly, CloudFront, Google, Azure…) with honest labeling "you're on the nearest edge node".
 - **Physics audit**: comparing geography against latency using calibrated signal propagation speed in fiber (~100 km/ms adjusted ×1.4 for non-linearity of real routes); impossible hops are marked ⚠, incorrectly trained records are demoted.
 - **Learning** (off / semi-auto / auto) with safeguards: promotion after 2+ observations on different days, TTL, conflict resolution, atomic writes, anycast is not learned.
