@@ -442,7 +442,7 @@ LANGS = {
         "hist_empty": "история пуста",
         "report_skipped": "⊘ {} узел(ов) пропущено (приватные/таймауты)",
         "about_title": "О программе",
-        "about_coding": "shitty vibe-coding with \n«Qwen3.8-Max»\n «Claude»",
+        "about_coding": "shitty vibe-coding with \n«Qwen 3.8-Max»\n «Claude»",
     },
     "en": {
         "title": "GeoTrace MAP", "addr": "Target address:",
@@ -706,7 +706,7 @@ class BgpInfo:
     """IXP-детект (PeeringDB) и роль AS (RIPEstat). Официальные API, кэш, без блокировок UI."""
     
     # PeeringDB WAF блокирует браузерные User-Agent. 
-    # Указываем имя приложения и ваш email (из окна About), чтобы пройти WAF.
+    # Указываем имя приложения и email, чтобы пройти WAF.
     PDB_HEADERS = {"User-Agent": "GeoTrace/1.0 (geotracemap@protonmail.com)"}
 
     def __init__(self, path):
@@ -726,6 +726,11 @@ class BgpInfo:
             return None
         if asn_clean in self.asn_geo:            # работает и для отрицательного кэша: неудачи хранятся как None
             return self.asn_geo[asn_clean]
+
+        with self.lock:
+        # Double-check
+            if asn_clean in self.asn_geo:
+                return self.asn_geo[asn_clean]
         try:
             net_resp = session.get(f"https://www.peeringdb.com/api/net?asn={asn_clean}",
                                    timeout=CONFIG["timeout"], headers=self.PDB_HEADERS).json()
@@ -785,6 +790,9 @@ class BgpInfo:
         В файловый кэш её не пишем сознательно — ответ слишком большой."""
         if self.fac_db:
             return
+        with self.lock:
+            if self.fac_db:
+                return
         try:
             fac_resp = session.get("https://www.peeringdb.com/api/fac",
                                    timeout=20, headers=self.PDB_HEADERS).json()
@@ -1065,7 +1073,7 @@ class PingManager:
         if not rtts and not lost:
             return L["m_waitreplies"]
         req = len(rtts) + lost
-        loss = int(round(lost / req * 100)) if req else 0
+        loss = round(lost / req * 100) if req else 0
         if rtts:
             return L["m_stats"].format(n=len(rtts), mn=int(round(min(rtts))),
                                        avg=int(round(sum(rtts) / len(rtts))),
@@ -2235,6 +2243,19 @@ class GeoTraceApp(tk.Tk):
 
         tk.Label(content, text=self.tr("about_coding"), bg=t["bg"],
                  fg=t["fg"], font=("Arial", 8, "italic")).pack()
+
+    # ── Кликабельный логотип GitHub в правом нижнем углу ──
+        def open_github(e=None):
+            import webbrowser
+            webbrowser.open("https://github.com/jdPhobos/GeoTrace-MAP")
+        
+    # Эмодзи осьминога 🐙 как отсылка к Octocat, цвет адаптируется к теме
+        gh_label = tk.Label(
+            win, text="🐙 GitHub", bg=t["bg"], fg=t["accent"],
+            font=("Arial", 12, "underline"), cursor="hand2"
+    )
+        gh_label.pack(side=tk.BOTTOM, anchor=tk.CENTER, padx=12, pady=8)
+        gh_label.bind("<Button-1>", open_github)
 
     # ------------------------------------------- clipboard / hotkeys (entry)
     def _on_entry_focus(self, event=None):
