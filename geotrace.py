@@ -2257,6 +2257,12 @@ class GeoTraceApp(tk.Tk):
         gh_label.pack(side=tk.BOTTOM, anchor=tk.CENTER, padx=12, pady=8)
         gh_label.bind("<Button-1>", open_github)
 
+        version_label = tk.Label(
+            win, text="v1.5.6", bg=t["bg"], fg="gray",
+            font=("Arial", 8)
+        )
+        version_label.place(relx=1.0, rely=1.0, anchor="se", x=-5, y=-5)
+
     # ------------------------------------------- clipboard / hotkeys (entry)
     def _on_entry_focus(self, event=None):
         self.entry.select_range(0, tk.END)
